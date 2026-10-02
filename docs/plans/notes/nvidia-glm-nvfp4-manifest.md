@@ -2,7 +2,7 @@
 
 Machine-readable twin: `nvidia-glm-nvfp4-manifest.json`. Numeric policy: `nvidia-glm-nvfp4-numeric-policy.json`.
 
-Pinned on 2026-10-02 from the Hugging Face revision API. No weight shard was downloaded. `implementation_head` is the plan commit this work starts from, when that tree was clean. `reference_status` is `NOT_INSPECTED`: the running server was not queried, and cache dtype is unknown.
+Pinned on 2026-10-02 from the Hugging Face revision API. No weight shard was downloaded. `implementation_head` is the plan commit this work starts from, when that tree was clean. `reference_status` is `BLOCKED_REFERENCE`: ports 8000 and 8080 on this workstation were closed, and the Spark serve was not inspected. Cache dtype is unknown.
 
 Checkpoint `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e38352348`.
 

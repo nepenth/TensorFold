@@ -13,6 +13,7 @@
   "world_size": 2,
   "cache_policy": null,
   "cache_policy_reason": "reference server has not been inspected",
-  "reference_status": "NOT_INSPECTED",
+  "reference_status": "BLOCKED_REFERENCE",
+  "reference_reason": "no local reference server was listening; the Spark serve was not inspected",
   "numeric_policy_id": "glm-nvfp4-tensorfold-1"
 }

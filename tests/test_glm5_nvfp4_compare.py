@@ -29,7 +29,7 @@ def test_pinned_manifest_loads():
     data = compare.load_manifest(NOTES / "nvidia-glm-nvfp4-manifest.json")
     policy = json.loads((NOTES / "nvidia-glm-nvfp4-numeric-policy.json").read_text())
     assert data["world_size"] == 2
-    assert data["reference_status"] == "NOT_INSPECTED"
+    assert data["reference_status"] == "BLOCKED_REFERENCE"
     assert data["numeric_policy_id"] == policy["id"]
     assert data["checkpoint_revision"] == "da920bb0b9f4a06727223a349e55468e38352348"
 
