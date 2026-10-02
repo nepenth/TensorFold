@@ -33,7 +33,7 @@ CPU work through the allocation inventory is on the branch. `load()` still raise
 | 3 Admit the recipe | Done. `QUANT_METHODS["cuda"]` includes `modelopt` only for static NVFP4, group 16. Neighbor recipes raise. `tests/cuda/test_glm_split_and_policy.py` passed on one Spark (10). |
 | 4 Splits | CPU path done in `split.py` and `tests/test_glm5_nvfp4_split.py`. `split_device` matches `split_bytes` on one Spark. That is the CUDA prefetch, not the MMA. |
 | 5A–5B Codec and prepared rows | Done in `nvfp4_codec.py`. This is TensorFold's e4m3 decoder, not current ModelOpt `main`, and not `quant4`. |
-| 5C–5D One real projection, lane and prompt kernels | **Needs a Spark.** `Fp4Linear.from_checkpoint` and the MMA have not been run. |
+| 5C–5D One real projection, lane and prompt kernels | Mapper landed. On one Spark, a rank-local dense gate (`N=6144`, `K=4096`) is an `Fp4Linear` with stored `input_scale` and uninverted `weight_scale_2`. Lane and prompt both returned finite bf16 `[1, 6144]`. Recorded `split_k` is 2. They were not compared bitwise. A numeric envelope is not claimed; that waits for the eager oracle. |
 | 11A Inventory | Done as `nvfp4_inventory` and `split_weights(..., draft_head=False)`. The engine uses that flag when `quant == "modelopt"`. Measured peaks (11B) are not done. |
 | 6 Load experts into the pointer table | **Needs a Spark** and the weight snapshot. |
 | 7 Startup before NCCL | Partial. Explicit `TF_GLM_MTP=1`, a drafter, and `--parallel` raise before the engine import. Inside `GlmEngine`, modelopt forces `mtp_on` false. The two-rank digest and the missing-peer timeout are not implemented. |
@@ -44,7 +44,7 @@ CPU work through the allocation inventory is on the branch. `load()` still raise
 
 Stop here for a full load. The machines are free. The next command is still not `tensorfold serve`.
 
-1. On one Spark, with PyTorch CUDA: Task 5C–5D, one dense projection through `lane` and through the prompt GEMM. The refusal and `split_device` already passed. No second model, no weight-shard delete.
+1. On one Spark, with PyTorch CUDA: Task 5C–5D has run one dense gate through `lane` and the prompt GEMM. Finite bf16, `split_k` 2. No numeric envelope yet. No second model, no weight-shard delete.
 2. On one Spark: Task 6, a synthetic or ranged layer into the pointer table, then Task 8 eager oracles and Task 10A–10C. Compute Sanitizer on a tiny fixture.
 3. On both Sparks: Task 9B–9C (real NCCL, missing peer, mismatched digest) and Task 10D graph replay. This is the first step that cannot be done on a single machine.
 4. Approved window only, after those gates: pull or reuse the 190.4 GiB snapshot at revision `da920bb`, record vLLM, run TensorFold, restore the previous serve. Task 12, then 13, then 14.
@@ -576,7 +576,7 @@ CPU, done on this branch unless noted:
 Spark, not done:
 
 - [x] `split_device` matches `split_bytes` on a GPU.
-- [ ] One dense projection is an `Fp4Linear` and matches the lane and prompt kernels.
+- [ ] One dense projection is an `Fp4Linear` and matches the lane and prompt kernels. The projection runs on both and is finite. `split_k` for `N=6144`, `K=4096` is 2. A numeric envelope is not recorded yet.
 - [ ] Pointer-table test shows one data pointer for eager and device paths.
 - [ ] Expert downs are not `matmul_group`. Unequal weights fail the test if they were.
 - [ ] Primitive graph and full-forward graph both follow a changed route.

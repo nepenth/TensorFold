@@ -19,18 +19,20 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 
 On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
 
-On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests passed, and `tests/cuda/test_glm_split_and_policy.py` collected and passed (10). The five NVFP4 CPU files passed in the same container (45). No model mount. Available memory stayed about 116 GiB. That qualifies the refusal and the CUDA prefetch split. It does not qualify `Fp4Linear.from_checkpoint` or the MMA.
+On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests passed, and `tests/cuda/test_glm_split_and_policy.py` collected and passed (10). The five NVFP4 CPU files passed in the same container (45). A later run packed one dense gate and ran the existing lane and prompt kernels. No model mount. Available memory stayed above 110 GiB.
 
 ## Not implemented
 
 - Device-indexed expert dispatch, pointer-table load, eager GPU oracles, packed prefill, CUDA graphs.
 - Two-rank digest, missing-peer timeout, captured NCCL.
-- `Fp4Linear.from_checkpoint` on a real projection. The codec is not `quant4`.
+- A numeric envelope for the dense projection. The codec is still not `quant4`.
 - vLLM record, teacher-forced compare, long context, speed.
 - Recipe text. Nothing is `DENSE_FIDELITY_PASS`.
 
 ## Needs the two DGX Sparks
 
-The skipped GPU tests have now passed on one Spark. The next single-Spark gate is Task 5C–5D: one dense projection through `lane` and the prompt GEMM. Then the pointer-table load, eager oracles, and the dispatch sanitizer.
+The skipped GPU tests have now passed on one Spark. A rank-local dense gate has also been packed with `Fp4Linear.from_checkpoint` and run through the existing lane kernel and the prompt GEMM. Outputs were finite bf16. Recorded `split_k` is 2. No numeric envelope. No shard pull. No serve.
+
+The next single-Spark gate is the pointer-table load, eager oracles, and the dispatch sanitizer.
 
 Both Sparks are required for NCCL, graph replay across ranks, the recorded comparison, and any speed number. Do not pull the 190.4 GiB snapshot, and do not start `tensorfold serve`, until those single-Spark gates have passed. The approved window already names how the previous serve is restored. That is not a license to start Task 12.
