@@ -1,8 +1,8 @@
 # GLM NVFP4 status
 
-Branch: `plan/glm-nvidia-nvfp4`. Plan: `docs/plans/2026-10-02-glm-nvidia-nvfp4.md`. Updated 2026-10-02 after the CPU stretch.
+Branch: `plan/glm-nvidia-nvfp4`. Plan: `docs/plans/2026-10-02-glm-nvidia-nvfp4.md`. Updated 2026-10-02 after the first Spark CUDA pass.
 
-Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e38352348`. Reference: `BLOCKED_REFERENCE` (`nvidia-glm-nvfp4-reference.md`). No weight shard has been downloaded. No server has been stopped.
+Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e38352348`. Reference: `BLOCKED_REFERENCE` (`nvidia-glm-nvfp4-reference.md`). No weight shard has been downloaded. The previous serve was a different checkpoint. It was stopped under an approved window. Restore steps are not in this public tree. The previous weights were left on disk.
 
 ## Implemented
 
@@ -17,7 +17,9 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 | `90ce7a8` | CPU splits. Scalars replicate. Packed width 96 is rejected. Rank-folder provenance is checked. |
 | `0203859` | Logical activation codec, prepared-row layout (`k64-mpad-4`), and `nvfp4_inventory`. |
 
-On this workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device. `tests/cuda/` was not collected.
+On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
+
+On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests passed, and `tests/cuda/test_glm_split_and_policy.py` collected and passed (10). The five NVFP4 CPU files passed in the same container (45). No model mount. Available memory stayed about 116 GiB. That qualifies the refusal and the CUDA prefetch split. It does not qualify `Fp4Linear.from_checkpoint` or the MMA.
 
 ## Not implemented
 
@@ -29,8 +31,6 @@ On this workstation, 47 tests passed and 2 were skipped: `load()` because PyTorc
 
 ## Needs the two DGX Sparks
 
-One Spark is enough for the skipped GPU tests, one dense projection, the pointer-table load, eager oracles, and the dispatch sanitizer.
+The skipped GPU tests have now passed on one Spark. The next single-Spark gate is Task 5C–5D: one dense projection through `lane` and the prompt GEMM. Then the pointer-table load, eager oracles, and the dispatch sanitizer.
 
-Both Sparks are required for NCCL, graph replay across ranks, the recorded vLLM comparison, and any speed number. Do not pull the 190.4 GiB snapshot, and do not start `tensorfold serve`, until those single-Spark gates have passed and a window names how the existing serve is restored.
-
-The first action on the cluster is to run the skipped tests and Task 5C–5D. It is not to serve the model.
+Both Sparks are required for NCCL, graph replay across ranks, the recorded comparison, and any speed number. Do not pull the 190.4 GiB snapshot, and do not start `tensorfold serve`, until those single-Spark gates have passed. The approved window already names how the previous serve is restored. That is not a license to start Task 12.
