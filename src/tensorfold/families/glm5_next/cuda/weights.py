@@ -229,15 +229,20 @@ class Weights:
         return self.rank * (self.cfg.vocab // self.world)
 
     def nbytes(self) -> int:
+        from tensorfold.cuda.nvfp4.linear import Fp4Linear, Staging
+        from tensorfold.families.glm5_next.cuda.nvfp4_table import RoutedTable
+
         total = 0
         seen = set()
+        owned = (Q4, B16, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW,
+                 Fp4Linear, Staging, RoutedTable)
 
         def add(t):
             nonlocal total
             if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
                 seen.add(t.data_ptr())
                 total += t.numel() * t.element_size()
-            elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
+            elif isinstance(t, owned):
                 for v in vars(t).values():
                     add(v)
             elif isinstance(t, (list, tuple)):

@@ -24,7 +24,7 @@ Decode and prefill share weights and the numeric meaning of a projection. They d
 
 Tracking note: `docs/plans/notes/nvidia-glm-nvfp4-status.md`. Branch `plan/glm-nvidia-nvfp4`. Checkpoint revision `da920bb0b9f4a06727223a349e55468e38352348`. Reference status `BLOCKED_REFERENCE`.
 
-CPU work through the allocation inventory is on the branch. `load()` still raises `NVFP4 tensors are not wired`. No shard has been pulled. One Spark has run the refusal and the CUDA prefetch split. It has not run an MMA.
+CPU work through the allocation inventory is on the branch. `load()` still raises `NVFP4 tensors are not wired`. No shard has been pulled. One Spark has packed a dense gate and a synthetic routed layer. It has not loaded the snapshot.
 
 | Task | State |
 | --- | --- |
@@ -35,7 +35,7 @@ CPU work through the allocation inventory is on the branch. `load()` still raise
 | 5A–5B Codec and prepared rows | Done in `nvfp4_codec.py`. This is TensorFold's e4m3 decoder, not current ModelOpt `main`, and not `quant4`. |
 | 5C–5D One real projection, lane and prompt kernels | Mapper landed. On one Spark, a rank-local dense gate (`N=6144`, `K=4096`) is an `Fp4Linear` with stored `input_scale` and uninverted `weight_scale_2`. Lane and prompt both returned finite bf16 `[1, 6144]`. Recorded `split_k` is 2. They were not compared bitwise. A numeric envelope is not claimed; that waits for the eager oracle. |
 | 11A Inventory | Done as `nvfp4_inventory` and `split_weights(..., draft_head=False)`. The engine uses that flag when `quant == "modelopt"`. Measured peaks (11B) are not done. |
-| 6 Load experts into the pointer table | **Needs a Spark** and the weight snapshot. |
+| 6 Load experts into the pointer table | Synthetic layer passed on one Spark. E=4 owners and the address table share `data_ptr`. E=288 allocated pointer slots only, not production weights. A scale disagreement raises before packing. `load()` still refuses a modelopt tree. The snapshot is not pulled. |
 | 7 Startup before NCCL | Partial. Explicit `TF_GLM_MTP=1`, a drafter, and `--parallel` raise before the engine import. Inside `GlmEngine`, modelopt forces `mtp_on` false. The two-rank digest and the missing-peer timeout are not implemented. |
 | 8 Eager oracles, 9 two ranks, 10 device dispatch and graphs | **Needs a Spark.** 9B and 10 need both machines. |
 | 12 Record and compare, 13 long context, 14 speed | **Needs both Sparks** and an approved window. Do not start these because the CPU tasks are finished. |
@@ -45,7 +45,7 @@ CPU work through the allocation inventory is on the branch. `load()` still raise
 Stop here for a full load. The machines are free. The next command is still not `tensorfold serve`.
 
 1. On one Spark, with PyTorch CUDA: Task 5C–5D has run one dense gate through `lane` and the prompt GEMM. Finite bf16, `split_k` 2. No numeric envelope yet. No second model, no weight-shard delete.
-2. On one Spark: Task 6, a synthetic or ranged layer into the pointer table, then Task 8 eager oracles and Task 10A–10C. Compute Sanitizer on a tiny fixture.
+2. On one Spark: the synthetic pointer table has passed. Next is Task 8 eager oracles, then Task 10A–10C. Compute Sanitizer on a tiny fixture. No snapshot pull.
 3. On both Sparks: Task 9B–9C (real NCCL, missing peer, mismatched digest) and Task 10D graph replay. This is the first step that cannot be done on a single machine.
 4. Approved window only, after those gates: pull or reuse the 190.4 GiB snapshot at revision `da920bb`, record vLLM, run TensorFold, restore the previous serve. Task 12, then 13, then 14.
 
@@ -577,7 +577,7 @@ Spark, not done:
 
 - [x] `split_device` matches `split_bytes` on a GPU.
 - [ ] One dense projection is an `Fp4Linear` and matches the lane and prompt kernels. The projection runs on both and is finite. `split_k` for `N=6144`, `K=4096` is 2. A numeric envelope is not recorded yet.
-- [ ] Pointer-table test shows one data pointer for eager and device paths.
+- [ ] Pointer-table test shows one data pointer for eager and device paths. Synthetic E=4 eager owners match the address table by `data_ptr`. The device dispatch path is not built.
 - [ ] Expert downs are not `matmul_group`. Unequal weights fail the test if they were.
 - [ ] Primitive graph and full-forward graph both follow a changed route.
 - [ ] Prefill worst-case capacity is in the live admission path. Empty experts do no logical work.

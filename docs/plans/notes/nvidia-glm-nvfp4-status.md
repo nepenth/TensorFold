@@ -1,6 +1,6 @@
 # GLM NVFP4 status
 
-Branch: `plan/glm-nvidia-nvfp4`. Plan: `docs/plans/2026-10-02-glm-nvidia-nvfp4.md`. Updated 2026-10-02 after the first Spark CUDA pass.
+Branch: `plan/glm-nvidia-nvfp4`. Plan: `docs/plans/2026-10-02-glm-nvidia-nvfp4.md`. Updated 2026-10-02 after the synthetic pointer-table pass.
 
 Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e38352348`. Reference: `BLOCKED_REFERENCE` (`nvidia-glm-nvfp4-reference.md`). No weight shard has been downloaded. The previous serve was a different checkpoint. It was stopped under an approved window. Restore steps are not in this public tree. The previous weights were left on disk.
 
@@ -19,11 +19,12 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 
 On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
 
-On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests passed, and `tests/cuda/test_glm_split_and_policy.py` collected and passed (10). The five NVFP4 CPU files passed in the same container (45). A later run packed one dense gate and ran the existing lane and prompt kernels. No model mount. Available memory stayed above 110 GiB.
+On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests passed, and `tests/cuda/test_glm_split_and_policy.py` collected and passed (10). The five NVFP4 CPU files passed in the same container (45). A later run packed one dense gate and ran the existing lane and prompt kernels. A synthetic routed layer then passed (14): E=4 owners match the address table by data pointer, and E=288 allocated pointer slots only. No model mount. Available memory stayed above 110 GiB.
 
 ## Not implemented
 
-- Device-indexed expert dispatch, pointer-table load, eager GPU oracles, packed prefill, CUDA graphs.
+- Device-indexed expert dispatch, eager GPU oracles, packed prefill, CUDA graphs.
+- A snapshot load. `load()` still raises `NVFP4 tensors are not wired`.
 - Two-rank digest, missing-peer timeout, captured NCCL.
 - A numeric envelope for the dense projection. The codec is still not `quant4`.
 - vLLM record, teacher-forced compare, long context, speed.
@@ -31,8 +32,8 @@ On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests pass
 
 ## Needs the two DGX Sparks
 
-The skipped GPU tests have now passed on one Spark. A rank-local dense gate has also been packed with `Fp4Linear.from_checkpoint` and run through the existing lane kernel and the prompt GEMM. Outputs were finite bf16. Recorded `split_k` is 2. No numeric envelope. No shard pull. No serve.
+The skipped GPU tests have now passed on one Spark. A rank-local dense gate has been packed and run through the existing lane kernel and the prompt GEMM. A synthetic routed layer is a single-owner pointer table. Outputs of the dense gate were finite bf16. Recorded `split_k` is 2. No numeric envelope. No shard pull. No serve.
 
-The next single-Spark gate is the pointer-table load, eager oracles, and the dispatch sanitizer.
+The next single-Spark gate is the eager oracles, then the dispatch sanitizer.
 
 Both Sparks are required for NCCL, graph replay across ranks, the recorded comparison, and any speed number. Do not pull the 190.4 GiB snapshot, and do not start `tensorfold serve`, until those single-Spark gates have passed. The approved window already names how the previous serve is restored. That is not a license to start Task 12.
