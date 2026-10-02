@@ -39,7 +39,7 @@ RUN = 128 << 20          # most bytes one read of neighbouring tensors takes (``
 GAP = 1 << 20            # most unused bytes such a read spans between two tensors (more reads other layers twice)
 READERS = 8              # reads in flight: past this the layers are built slower than they are read
 DTYPE_BYTES = {"U32": 4, "I32": 4, "F32": 4, "BF16": 2, "F16": 2, "I16": 2, "U16": 2, "U8": 1, "I8": 1, "I64": 8,
-               "F64": 8}
+               "F64": 8, "F8_E4M3": 1}
 # the files a rank folder needs besides its weights (the tokenizer, chat template and configs)
 SMALL = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
          "processor_config.json", "model.safetensors.index.json")
@@ -54,6 +54,9 @@ EXL3_RULES = {("gate", "trellis"): "dim1", ("gate", "suh"): "rep", ("gate", "svh
 def rule(name: str) -> str:
     if name.startswith("model.visual."):
         return "drop"
+    # Before the row/column scan: those patterns also match gate_proj.input_scale and would be ambiguous.
+    if name.endswith((".input_scale", ".weight_scale_2")):
+        return "rep"
     m = EXL3_EXPERT.search(name)
     if m:
         proj, part = m.groups()
@@ -71,7 +74,24 @@ def read_header(path: str | Path) -> tuple[dict, int]:
     return header, 8 + n
 
 
-def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, rank: int) -> tuple[np.ndarray, list[int]]:
+def nvfp4_column_legal(shape: list[int], dtype: str) -> None:
+    """TP=2 column split: each rank's logical K must be a multiple of 64.
+
+    For a packed ``U8`` weight, stored columns ``P`` are ``K/2`` and each rank's logical K is ``P``, so ``P % 64 == 0``
+    on the original tensor. ``P % 32 == 0`` lets ``P = 96`` through. For an ``F8_E4M3`` scale, stored columns are
+    ``K/16`` and each rank's logical K is ``8 * columns``.
+    """
+
+    if dtype == "U8":
+        if len(shape) < 2 or shape[1] % 64:
+            raise ValueError(f"NVFP4 packed width {shape[1] if len(shape) > 1 else shape} is not a multiple of 64")
+    elif dtype == "F8_E4M3":
+        if len(shape) < 2 or shape[1] % 8:
+            raise ValueError(f"NVFP4 scale width {shape[1] if len(shape) > 1 else shape} does not leave a legal K")
+
+
+def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, rank: int, *,
+                dtype: str | None = None) -> tuple[np.ndarray, list[int]]:
     """A tensor's bytes -> rank's part of them and its shape."""
 
     if kind == "rep":
@@ -84,6 +104,8 @@ def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, ran
         half = rows // 2
         return raw[rank * half * per:(rank + 1) * half * per], [half] + list(shape[1:])
     if kind == "col":
+        if dtype in ("U8", "F8_E4M3"):
+            nvfp4_column_legal(list(shape), dtype)
         if len(shape) != 2 or shape[1] % 2:
             raise ValueError(f"column split needs an even 2-D shape, got {shape}")
         view = raw.reshape(shape[0], shape[1] * itemsize)
@@ -101,7 +123,7 @@ def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, ran
     raise ValueError(kind)
 
 
-def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int):
+def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int, *, dtype: str | None = None):
     """``split_bytes`` for a uint8 tensor on the GPU: the rank's part (a new contiguous tensor) and its shape."""
 
     if kind == "rep":
@@ -112,6 +134,8 @@ def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int):
         per, half = raw.numel() // shape[0], shape[0] // 2
         return raw[rank * half * per:(rank + 1) * half * per].clone(), [half] + list(shape[1:])
     if kind in ("col", "dim1"):
+        if kind == "col" and dtype in ("U8", "F8_E4M3"):
+            nvfp4_column_legal(list(shape), dtype)
         if len(shape) < 2 or shape[1] % 2 or (kind == "col" and len(shape) != 2):
             raise ValueError(f"{kind} split needs an even second dim, got {shape}")
         inner = int(np.prod(shape[2:])) * itemsize
@@ -126,7 +150,7 @@ def torch_dtype(dtype: str):
 
     return {"U32": torch.uint32, "I32": torch.int32, "F32": torch.float32, "BF16": torch.bfloat16, "F16": torch.float16,
             "I16": torch.int16, "U16": torch.uint16, "U8": torch.uint8, "I8": torch.int8, "I64": torch.int64,
-            "F64": torch.float64}[dtype]
+            "F64": torch.float64, "F8_E4M3": torch.float8_e4m3fn}[dtype]
 
 
 def rank_files(model_dir: str | Path, rank: int) -> list[Path]:
@@ -148,6 +172,11 @@ class RankReader:
                              "full checkpoint")
         self.split = bool(mine)
         if self.split:
+            revision_file = self.dir / "nvfp4-revision.txt"
+            expected = revision_file.read_text().strip() if revision_file.is_file() else None
+            for path in mine:
+                header, _ = read_header(path)
+                check_rank_metadata(header.get("__metadata__"), rank=rank, revision=expected)
             self.folder = SafeTensors(mine, self.io)
             self.index = dict.fromkeys(self.folder.keys())
             return
@@ -207,7 +236,7 @@ class RankReader:
         import torch
 
         _, _, _, kind, shape, dtype = span
-        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank)
+        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, dtype=dtype)
         if own and np.may_share_memory(data, raw):
             data = data.copy()
         return torch.from_numpy(data).view(torch_dtype(dtype)).reshape(shape)
@@ -224,7 +253,7 @@ class RankReader:
         if not raw.is_cuda:
             return self._tensor(raw.numpy(), span, own=True)
         _, _, _, kind, shape, dtype = span
-        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank)
+        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, dtype=dtype)
         return data.view(torch_dtype(dtype)).reshape(shape)
 
 def write(path: str, tensors: list[tuple[str, str, list[int], np.ndarray]], metadata: dict | None) -> None:
@@ -246,7 +275,25 @@ def write(path: str, tensors: list[tuple[str, str, list[int], np.ndarray]], meta
     os.replace(tmp, path)
 
 
-def split_file(src: str | Path, out: str | Path, rank: int) -> dict:
+def check_rank_metadata(metadata: dict | None, *, rank: int, revision: str | None = None) -> None:
+    """Reject an NVFP4 rank folder whose marker names the wrong rank, world, or source revision.
+
+    Folders without ``nvfp4_split`` are the MLX and EXL3 rank folders and are left alone.
+    """
+
+    if not metadata or "nvfp4_split" not in metadata:
+        return
+    if metadata.get("nvfp4_split") != 1:
+        raise ValueError(f"NVFP4 split format {metadata.get('nvfp4_split')!r} is not 1")
+    if int(metadata.get("world", -1)) != 2:
+        raise ValueError(f"NVFP4 rank folder world {metadata.get('world')!r} is not 2")
+    if int(metadata.get("rank", -1)) != rank:
+        raise ValueError(f"NVFP4 rank folder is rank {metadata.get('rank')!r}, not {rank}")
+    if revision is not None and metadata.get("revision") != revision:
+        raise ValueError(f"NVFP4 rank folder revision {metadata.get('revision')!r} is not {revision}")
+
+
+def split_file(src: str | Path, out: str | Path, rank: int, *, provenance: dict | None = None) -> dict:
     """One checkpoint file -> OUT/<stem>.rank<R>.safetensors with the rank's part of every tensor it keeps."""
 
     header, base = read_header(src)
@@ -263,11 +310,17 @@ def split_file(src: str | Path, out: str | Path, rank: int) -> dict:
             continue
         a, b = info["data_offsets"]
         itemsize = DTYPE_BYTES[info["dtype"]]
-        data, shape = split_bytes(mm[base + a:base + b], info["shape"], itemsize, kind, rank)
+        data, shape = split_bytes(mm[base + a:base + b], info["shape"], itemsize, kind, rank, dtype=info["dtype"])
         if int(np.prod(shape)) * itemsize != data.size:
             raise ValueError(f"{name}: {shape} does not match {data.size} bytes")
         part.append((name, info["dtype"], shape, data))
     os.makedirs(out, exist_ok=True)
+    if provenance:
+        metadata = dict(metadata or {})
+        metadata.update(provenance)
+        metadata["nvfp4_split"] = 1
+        metadata["world"] = 2
+        metadata["rank"] = rank
     if part:
         write(os.path.join(str(out), f"{stem}.rank{rank}.safetensors"), part, metadata)
     return summary
