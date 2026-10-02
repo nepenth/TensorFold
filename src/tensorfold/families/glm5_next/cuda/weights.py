@@ -102,6 +102,7 @@ class Config:
             index_topk=int(t.get("index_topk", 2048)), kpool=int(t.get("index_kpool", 4)),
             limit=float(t.get("swiglu_limit", 10.0)), kinds=kinds, mlp_kinds=mlp_kinds, eos=eos,
             mtp_layers=int(t.get("num_nextn_predict_layers", 0)), group_size=int(quant.get("group_size", 64)),
+            # NVFP4's group of 16 lives in config_groups, not this field. The default 64 is the MLX group.
             bits=bits_of(quant), quant=str(quant.get("quant_method") or "mlx").lower(),
         )
 
@@ -262,8 +263,12 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
 
     world = 2
     cfg = Config.read(model_dir)
+    if cfg.quant == "modelopt":
+        raise ValueError("GLM-5.3-Flash NVFP4 tensors are not wired")
     if cfg.quant not in ("mlx", "exl3"):
-        raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
+        raise ValueError(
+            f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit, EXL3, or NVIDIA NVFP4, not {cfg.quant}"
+        )
     exl3 = cfg.quant == "exl3"
     dev = torch.device(device)
     rd = RankReader(model_dir, rank)

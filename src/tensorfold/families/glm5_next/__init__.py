@@ -15,8 +15,8 @@ KERNEL_PACKAGE = "tensorfold.kernels.glm.flash.v1"
 # the prompt experts' sorted gather (Flash Next's prompt matmuls), hashed into snapshot keys
 KERNEL_DEPENDENCIES = ("tensorfold.kernels.qwen.flash_next.v1.prefill_mm",)
 KERNEL_VERSION = "v1"
-# the storage formats each engine reads: MLX affine on a Mac; that or EXL3 routed experts on CUDA
-QUANT_METHODS = {"mlx": ("mlx",), "cuda": ("mlx", "exl3")}
+# the storage formats each engine reads: MLX affine on a Mac; that, EXL3, or NVIDIA NVFP4 on CUDA
+QUANT_METHODS = {"mlx": ("mlx",), "cuda": ("mlx", "exl3", "modelopt")}
 # the EXL3 variant the CUDA kernels read (4-bit trellis, the "mcg" codebook, routed experts only)
 EXL3_VARIANT = {"bits": 4, "codebook": "mcg", "scope": "glm53_routed_experts_only"}
 # buffers of 200 ops and 200 MB, so a prompt chunk's memory frees as it runs; no TF32: row kernels repeat fp32
@@ -43,6 +43,17 @@ def check(model_dir: str | Path) -> None:
     if want == "float32" and sys.platform != "darwin":
         raise ValueError("tensorfold_activation_dtype float32 is the Mac engine; the CUDA engine stays bf16")
     method = quant_method(config)
+    if method == "modelopt":
+        if sys.platform == "darwin":
+            raise ValueError("GLM-5.3-Flash NVFP4 is the CUDA engine; the Mac engine has no NVFP4 lane. "
+                             f"{OWN_MODEL_HELP}")
+        from tensorfold.families.glm5_next.cuda.nvfp4_policy import admit_recipe
+
+        try:
+            admit_recipe(config.get("quantization_config") or config.get("quantization") or {})
+        except ValueError as exc:
+            raise ValueError(f"{exc}. {OWN_MODEL_HELP}") from exc
+        return
     if method == "exl3":
         # the CUDA engine's layout; the Mac engine refuses it before this through QUANT_METHODS (require_readable)
         found = config.get("quantization_config") or config.get("quantization") or {}
@@ -211,6 +222,16 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 1, rank: 
                          "with --tp 2 --rank R --master ADDRESS on both (rank 1 first)")
     if not master:
         raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
+    from tensorfold.families import quant_method, read_config
+
+    if quant_method(read_config(model_dir)) == "modelopt":
+        import os
+
+        from tensorfold.families.glm5_next.cuda.nvfp4_policy import decide
+
+        # Before the engine import: that import constructs nothing, but GlmEngine's body starts NCCL.
+        decide(os.environ.get("TF_GLM_MTP"), no_drafts=bool(no_drafts), drafter=bool(drafter),
+               parallel=bool(options.get("parallel")))
     from .cuda.engine import DEFAULT_POLICY, DFLASH_POLICY, GlmEngine
 
     if mtp_drafts is None:

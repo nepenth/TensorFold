@@ -138,7 +138,10 @@ class GlmEngine:
 
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
-        weights_estimate = split_weights(rule)
+        if cfg.quant == "modelopt":
+            # Unset TF_GLM_MTP still means "1" for MLX and EXL3. This quant never loads layer 45.
+            self.mtp_on = False
+        weights_estimate = split_weights(rule, draft_head=cfg.quant != "modelopt")
         if not self.mtp_on:
             weights_estimate = without_mtp(weights_estimate, cfg.layers)
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,

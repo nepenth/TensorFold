@@ -248,7 +248,7 @@ def test_requests_past_the_context_get_a_400_before_streaming(tmp_path):
 def test_check_accepts_mlx_4bit_and_mias_exl3_only(tmp_path):
     from tensorfold.families import glm5_next
 
-    assert glm5_next.QUANT_METHODS == {"mlx": ("mlx",), "cuda": ("mlx", "exl3")}
+    assert glm5_next.QUANT_METHODS == {"mlx": ("mlx",), "cuda": ("mlx", "exl3", "modelopt")}
     cases = {
         "mlx4": ({"quantization": {"bits": 4, "group_size": 64}}, True),
         "mlx8": ({"quantization": {"bits": 8, "group_size": 64}}, False),

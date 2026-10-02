@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -57,7 +58,8 @@ def _family():
 
 
 def _config(**extra) -> dict:
-    return {"model_type": "glm5_next", "text_config": TEXT, "quantization_config": NVIDIA_QUANT, **extra}
+    return {"model_type": "glm5_next", "text_config": deepcopy(TEXT),
+            "quantization_config": deepcopy(NVIDIA_QUANT), **extra}
 
 
 def test_modelopt_block_is_recognized():
@@ -71,16 +73,22 @@ def test_modelopt_block_is_recognized():
     assert scheme({"weight": ("U8", [2048, 2048]), "weight_scale": ("F8_E4M3", [2048, 256])}) == "nvfp4"
 
 
-def test_require_readable_still_refuses_modelopt():
+def test_require_readable_accepts_this_recipe_and_refuses_compressed_tensors():
     from tensorfold.families import require_readable
 
+    require_readable(_family(), _config(), "cuda")
+    bad = _config()
+    bad["quantization_config"] = {**NVIDIA_QUANT, "quant_method": "compressed-tensors"}
     with pytest.raises(ValueError, match="does not read this checkpoint's weights"):
-        require_readable(_family(), _config(), "cuda")
+        require_readable(_family(), bad, "cuda")
 
 
-def test_family_check_still_refuses_modelopt(tmp_path: Path):
-    (tmp_path / "config.json").write_text(json.dumps(_config()))
-    with pytest.raises(ValueError, match="modelopt NVFP4"):
+def test_family_check_names_a_bad_group(tmp_path: Path):
+    bad = _config()
+    group = bad["quantization_config"]["config_groups"]["group_0"]
+    group["weights"] = {**group["weights"], "group_size": 32}
+    (tmp_path / "config.json").write_text(json.dumps(bad))
+    with pytest.raises(ValueError, match="group_size"):
         glm5_next.check(tmp_path)
 
 
@@ -91,7 +99,7 @@ def test_glm_cuda_loader_still_refuses_modelopt(tmp_path: Path):
     (tmp_path / "config.json").write_text(json.dumps(_config()))
     from tensorfold.families.glm5_next.cuda.weights import load
 
-    with pytest.raises(ValueError, match="MLX 4-bit or EXL3"):
+    with pytest.raises(ValueError, match="NVFP4 tensors are not wired"):
         load(tmp_path, rank=0)
 
 
@@ -119,3 +127,47 @@ def test_drafts_and_parallel_are_refused(kwargs):
 def test_bad_mtp_value_is_named():
     with pytest.raises(ValueError, match="TF_GLM_MTP"):
         decide("yes", no_drafts=True, drafter=False, parallel=False)
+
+
+def test_admit_accepts_the_static_group_16_recipe():
+    from tensorfold.families.glm5_next.cuda.nvfp4_policy import admit_recipe
+
+    admit_recipe(NVIDIA_QUANT)
+
+
+@pytest.mark.parametrize("mutate,match", [
+    (lambda block: block.update(quant_method="compressed-tensors"), "compressed-tensors"),
+    (lambda block: block.update(quant_algo="W4A16_NVFP4"), "quant_algo"),
+    (lambda block: block["config_groups"]["group_0"]["weights"].update(group_size=32), "group_size"),
+    (lambda block: block["config_groups"]["group_0"]["weights"].update(type="int"), "not 4-bit float"),
+    (lambda block: block["config_groups"]["group_0"]["weights"].update(dynamic=True), "dynamic"),
+    (lambda block: block["config_groups"]["group_0"].pop("input_activations"), "missing"),
+    (lambda block: block.update(global_scale=float("nan")), "finite and positive"),
+])
+def test_admit_rejects_neighbor_recipes(mutate, match):
+    from tensorfold.families.glm5_next.cuda.nvfp4_policy import admit_recipe
+
+    block = deepcopy(NVIDIA_QUANT)
+    mutate(block)
+    with pytest.raises(ValueError, match=match):
+        admit_recipe(block)
+
+
+def test_family_check_accepts_the_recipe_and_cuda_engine_stops_before_nccl(tmp_path: Path, monkeypatch):
+    import builtins
+
+    (tmp_path / "config.json").write_text(json.dumps(_config()))
+    glm5_next.check(tmp_path)
+    monkeypatch.setenv("TF_GLM_MTP", "1")
+    seen: list[str] = []
+    real = builtins.__import__
+
+    def track(name, globals=None, locals=None, fromlist=(), level=0):
+        if "cuda.engine" in name or "cuda.comm" in name:
+            seen.append(name)
+        return real(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", track)
+    with pytest.raises(ValueError, match="unqualified"):
+        glm5_next.cuda_engine(tmp_path, tp=2, rank=0, master="127.0.0.1", no_drafts=True)
+    assert seen == []
