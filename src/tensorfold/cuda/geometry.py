@@ -97,7 +97,7 @@ def indexed_weights(world: int, mtp: bool, mapped_tables: bool = True):
     return transform
 
 
-def split_weights(rule, world: int = 2):
+def split_weights(rule, world: int = 2, *, draft_head: bool = True):
     def transform(name: str, info: dict) -> tuple[int, int]:
         kind = rule(name)
         if kind == "drop":
@@ -113,10 +113,30 @@ def split_weights(rule, world: int = 2):
         cast = name.endswith((".A_log", ".dt_bias", ".hc_attn_base", ".hc_attn_scale", ".hc_ffn_base",
                               ".hc_ffn_scale", ".e_score_correction_bias"))
         total = padded(info, shape, float32=cast, name=name)
-        if name == "lm_head.weight" and info["dtype"] in ("BF16", "F16", "F32"):
+        if name == "lm_head.weight" and info["dtype"] in ("BF16", "F16", "F32") and draft_head:
             total += math.prod(shape) * 9 // 16  # the additional 4-bit draft head
         return total, 0
     return transform
+
+
+def nvfp4_inventory(*, prefill_rows: int = 2048, hidden: int = 4096, top_k: int = 8) -> dict:
+    """Bytes the NVFP4 serial path is allowed to allocate, before any expert table exists.
+
+    One pointer table owns the packed experts. Nine fp32 slots are routed 0-7 plus the shared expert in slot 8.
+    The old bf16 ``ey`` and the 4-bit draft head are not allocated. A second packed copy is zero by construction.
+    """
+
+    slots = top_k + 1
+    return {
+        "storage": "pointer-table",
+        "duplicate_expert_storage": 0,
+        "draft_head": 0,
+        "bf16_ey": 0,
+        "shared_slot": top_k,
+        "fp32_slots": prefill_rows * slots * hidden * 4,
+        "prefill_rows": prefill_rows,
+        "slots": slots,
+    }
 
 
 def kv_bytes(head_dim: int, bits: int = 16) -> int:
