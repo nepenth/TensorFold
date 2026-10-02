@@ -20,6 +20,37 @@ Decode and prefill share weights and the numeric meaning of a projection. They d
 
 **Pin:** Implement against that commit. Do not rebase onto a newer `main` inside these tasks. Record `HEAD`, dirty state, and the checkpoint revision in the manifest. An ancestor check is not enough: uncommitted edits are part of the manifest. A later upstream move is a new manifest and a targeted requalification.
 
+## Where we are
+
+Tracking note: `docs/plans/notes/nvidia-glm-nvfp4-status.md`. Branch `plan/glm-nvidia-nvfp4`. Checkpoint revision `da920bb0b9f4a06727223a349e55468e38352348`. Reference status `BLOCKED_REFERENCE`.
+
+CPU work through the allocation inventory is on the branch. `load()` still raises `NVFP4 tensors are not wired`. No shard has been pulled, and no Spark has run a kernel.
+
+| Task | State |
+| --- | --- |
+| 0 Manifest, 0A comparator, 1 census, 2 refusal lock | Done. `tests/test_glm5_nvfp4_compare.py` and the CPU half of `tests/test_glm5_nvfp4_config.py`. |
+| 0B Reference | `BLOCKED_REFERENCE`. This workstation had nothing on ports 8000 or 8080. The Spark serve was not inspected. |
+| 3 Admit the recipe | Done. `QUANT_METHODS["cuda"]` includes `modelopt` only for static NVFP4, group 16. Neighbor recipes raise. `tests/cuda/test_glm_split_and_policy.py` was updated and has not been collected here, because `tests/cuda/` needs an NVIDIA GPU. |
+| 4 Splits | CPU path done in `split.py` and `tests/test_glm5_nvfp4_split.py`. `split_device` is skipped with no GPU. That skip is not qualification of the CUDA prefetch. |
+| 5A–5B Codec and prepared rows | Done in `nvfp4_codec.py`. This is TensorFold's e4m3 decoder, not current ModelOpt `main`, and not `quant4`. |
+| 5C–5D One real projection, lane and prompt kernels | **Needs a Spark.** `Fp4Linear.from_checkpoint` and the MMA have not been run. |
+| 11A Inventory | Done as `nvfp4_inventory` and `split_weights(..., draft_head=False)`. The engine uses that flag when `quant == "modelopt"`. Measured peaks (11B) are not done. |
+| 6 Load experts into the pointer table | **Needs a Spark** and the weight snapshot. |
+| 7 Startup before NCCL | Partial. Explicit `TF_GLM_MTP=1`, a drafter, and `--parallel` raise before the engine import. Inside `GlmEngine`, modelopt forces `mtp_on` false. The two-rank digest and the missing-peer timeout are not implemented. |
+| 8 Eager oracles, 9 two ranks, 10 device dispatch and graphs | **Needs a Spark.** 9B and 10 need both machines. |
+| 12 Record and compare, 13 long context, 14 speed | **Needs both Sparks** and an approved window. Do not start these because the CPU tasks are finished. |
+
+### Spark boundary
+
+Stop here until the two DGX Sparks are available. The first command on that hardware is not `tensorfold serve`.
+
+1. On one Spark, with PyTorch CUDA: run the skipped tests (`load()` refusal, `split_device`) and Task 5C–5D, one dense projection through `lane` and through the prompt GEMM. No second model, no weight-shard delete.
+2. On one Spark: Task 6, a synthetic or ranged layer into the pointer table, then Task 8 eager oracles and Task 10A–10C. Compute Sanitizer on a tiny fixture.
+3. On both Sparks: Task 9B–9C (real NCCL, missing peer, mismatched digest) and Task 10D graph replay. This is the first step that cannot be done on a single machine.
+4. Approved window only, after those gates: pull or reuse the 190.4 GiB snapshot at revision `da920bb`, record vLLM, run TensorFold, restore the previous serve. Task 12, then 13, then 14.
+
+A CPU torch wheel can unskip the `load()` refusal test. It cannot qualify `split_device`, the MMA, graphs, or two-rank collectives.
+
 ---
 
 ## Decision record
@@ -530,17 +561,27 @@ RedHat compressed-tensors, after `DENSE_FIDELITY_PASS`, reusing the Qwen recipro
 
 ## Checklist
 
-- [ ] Manifest names tree, dirty state, and checkpoint revision. Launches use that directory.
-- [ ] Comparator tests pass on CPU, including the false near-tie and the top-k refusal.
-- [ ] Census matches the table, or the plan was updated before loader work.
-- [ ] `test_glm5_nvfp4_config.py`, `test_glm5_nvfp4_split.py`, and `test_glm5_nvfp4_loader.py` pass. GPU skips are not qualification.
-- [ ] Qwen and Flash Next still refuse NVFP4 `--tp 2`. MLX/EXL3 `MTP_DEFAULT` is still `"1"`.
-- [ ] Unset `TF_GLM_MTP` on this quant does not read layer 45 and does not call NCCL first.
+CPU, done on this branch unless noted:
+
+- [x] Manifest names the plan commit, the checkpoint revision `da920bb`, and hashes. Launches still must use that snapshot once it exists. `implementation_head` in the JSON is the plan commit `d3b7b07`, not every later commit.
+- [x] Comparator tests pass on CPU, including the false near-tie and the top-k refusal. Reference status is `BLOCKED_REFERENCE`.
+- [x] Census matches the table.
+- [x] `tests/test_glm5_nvfp4_config.py`, `tests/test_glm5_nvfp4_split.py`, `tests/test_glm5_nvfp4_codec.py`, and `tests/test_glm5_nvfp4_inventory.py` pass. The `load()` test and `split_device` were skipped with no PyTorch CUDA. `tests/test_glm5_nvfp4_loader.py` does not exist yet.
+- [x] MLX/EXL3 `MTP_DEFAULT` is still `"1"` (`tests/test_glm_mtp_setting.py`).
+- [ ] Qwen and Flash Next still refuse NVFP4 `--tp 2`. The tests live under `tests/cuda/` and were not collected here.
+- [x] Explicit `TF_GLM_MTP=1` on this quant raises before the engine import. Modelopt forces `mtp_on` false inside `GlmEngine`. The two-rank digest is not built yet.
+- [x] Prepared-row test fails if the scale layout is treated as row-major. Scale axis 0 is a K group.
+- [x] Inventory says one pointer table, nine fp32 slots, no draft head, no second copy. Nothing has allocated those bytes yet.
+
+Spark, not done:
+
+- [ ] `split_device` matches `split_bytes` on a GPU.
+- [ ] One dense projection is an `Fp4Linear` and matches the lane and prompt kernels.
 - [ ] Pointer-table test shows one data pointer for eager and device paths.
 - [ ] Expert downs are not `matmul_group`. Unequal weights fail the test if they were.
-- [ ] Prepared-row round-trip fails if scale axis 0 is treated as the row axis.
 - [ ] Primitive graph and full-forward graph both follow a changed route.
-- [ ] Prefill worst-case capacity is in admission. Empty experts do no logical work.
+- [ ] Prefill worst-case capacity is in the live admission path. Empty experts do no logical work.
+- [ ] Two-rank digest, missing peer, and captured collectives.
 - [ ] Sanitizer result for the dispatch is pass or an explicit limitation.
 - [ ] No `incoai` pull, no second model copy, live serve restored after any approved window.
 - [ ] Recipe text matches a status record. `DENSE_FIDELITY_PASS` is not `LONG_CONTEXT_FIDELITY_PASS`.
