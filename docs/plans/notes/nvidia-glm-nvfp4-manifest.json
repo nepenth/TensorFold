@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "implementation_base": "56e2e3ec55bc0ae1d7d5158c4fa2c79a3567ab21",
+  "implementation_head": "d3b7b070358c79e7905436eab7b9a017bdfdff61",
+  "dirty": false,
+  "patch_sha256": null,
+  "checkpoint_repo": "nvidia/GLM-5.3-Flash-NVFP4",
+  "checkpoint_revision": "da920bb0b9f4a06727223a349e55468e38352348",
+  "config_sha256": "41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf",
+  "index_sha256": "26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1",
+  "tokenizer_sha256": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+  "tokenizer_config_sha256": "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc",
+  "world_size": 2,
+  "cache_policy": null,
+  "cache_policy_reason": "reference server has not been inspected",
+  "reference_status": "NOT_INSPECTED",
+  "numeric_policy_id": "glm-nvfp4-tensorfold-1"
+}

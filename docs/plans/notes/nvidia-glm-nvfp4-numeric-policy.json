@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "glm-nvfp4-tensorfold-1",
+  "global_activation_factor": "stored input_scale, not recomputed from the activation",
+  "block_scale": "tensorfold nvfp4q.block_scale: SATFINITE e4m3, multiply by zero when the scale byte is 0. Current ModelOpt main clamps tiny block scales toward 2^-9 before the cast. Those policies are not assumed identical.",
+  "gate_up": "fp4 x fp4, bf16 output",
+  "swiglu": "min(gate, 10); clamp(up, -10, 10); round g*sigmoid(g) to bf16; multiply by u in fp32; round the product to bf16",
+  "down": "fp4 x fp4, fp32 partial",
+  "combine": "selected-slot order, shared expert last at weight 1",
+  "tp_sum": "fp32 partials, rank 0 first",
+  "weight_scale_2": "stored ModelOpt factor, not the reciprocal"
+}
