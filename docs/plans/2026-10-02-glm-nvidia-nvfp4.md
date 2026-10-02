@@ -1,22 +1,24 @@
 # GLM-5.3-Flash NVIDIA NVFP4 Implementation Plan
 
-> **For Hermes:** Use the subagent-driven-development skill to implement this plan task-by-task.
->
-> **This commit is the plan only.** Do not implement NVFP4, do not pull weight shards, and do not start a serve in this commit.
+> **For the orchestrator:** This document is the plan only. Do not implement NVFP4, pull weight shards, or start a serve in a documentation commit. A later implementation uses the work streams in [Work streams](#work-streams). Do not load a second model, stop the existing server, or occupy its GPUs unless a task explicitly says that window was approved, and that approval includes how the server is restored.
 
-**Goal:** Teach TensorFold's `glm5_next` CUDA path to load and serve `nvidia/GLM-5.3-Flash-NVFP4` in that checkpoint's math (NVFP4 weights, FP4 activations under the stored global input scale, per-16 runtime block scales, FP4×FP4 on SM 12.x), on two ranks, with CUDA graphs that follow each step's routing. Qualify it against a recorded vLLM reference on the same weights. Publish speed only after that qualification, and only against the traffic model below, which is a partial bound.
+**Goal:** Load the pinned NVIDIA ModelOpt checkpoint without changing its stored codes or scale meanings. Run its dense MLPs and routed experts as W4A4 on TensorFold's existing SM 12.x FP4 multiply. Keep the BF16 modules and GLM's existing arithmetic. Serve one request at TP=2, with device-driven routing. Qualify named execution modes against a recorded reference on the same checkpoint.
 
-**Architecture:** Reuse `format.scheme`, `Fp4Linear.from_checkpoint`, `checkpoint.quant4`, and the MMA in `lane4.cu` / `gemm_ck.cu`. Do not write a new multiply, do not vendor CUTLASS or FlashInfer, and do not send routed experts through `experts.cu` (bf16 activations).
+**Architecture:** Reuse `format.scheme`, `Fp4Linear.from_checkpoint`, `checkpoint.quant4`, and the MMA in `lane4.cu` / `gemm_ck.cu`. Do not write a new multiply. Do not vendor CUTLASS, FlashInfer, or TensorRT-LLM. Do not call `experts.cu` (bf16 activations).
 
-`checkpoint.matmul_group` quantizes **one** input and applies every matrix to that same quantized tensor. That is the dense gate/up case, and the expert gate/up case, because those projections share the residual. It is not the down case. Each expert's SwiGLU output is a different vector. A shared `down.input_scale` does not make those vectors one tensor.
+`checkpoint.matmul_group` quantizes one input and applies every matrix to that same tensor. Dense gate/up and expert gate/up may use that, because they share the residual. Expert downs may not. Each selected expert has its own SwiGLU output.
 
-The serve path, including CUDA graphs, indexes expert weights from a device table built at load. `graphs.Graphs` captures `forward.compute`. A Python loop over `Fp4Linear` objects bakes those pointers into the graph; writing new ids into a buffer afterward does not retarget them. Recapturing after every route, and copying the selected experts' weights into a fixed buffer each token, are both rejected: the first rebuilds the graph inside the forward, the second spends the bandwidth the quant was meant to save.
+`checkpoint.cpp` `lane` takes one code pointer, one weight pointer, and one scalar. A Python table of experts does not make that binding device-indexed. A small dispatch wrapper may select expert addresses, row destinations, and the existing `mma_fp4` reduction. That wrapper is in scope. A new numeric recipe is not. Do not reuse the lane kernel's split-K grid dimension as an expert dimension.
 
-Decode and prefill share the numeric contract and the weight layout. They do not share a scheduler. Decode has eight experts for one row. A prefill chunk has a different route on every row.
+The first expert storage is a **pointer table**: each `Fp4Linear` owns its packed `words` and `bs` once, and a device table holds addresses, dimensions, and the rounded `act * weight_scale_2`. Do not allocate those tensors and then stack a second copy. Routed-expert codes and scales are about **79.73 GiB per rank** (`42 * 288 * 14,155,776 / 2`). A duplicate would not fit next to the BF16 weights on a 128 GB Spark. An arena that packs straight into one allocation is allowed later only if a profile shows the pointer table missing bandwidth, and only if it still has a single owner.
 
-**Tech stack:** TensorFold 0.6.2 (Apache-2.0), base `56e2e3ec55bc0ae1d7d5158c4fa2c79a3567ab21`. PyTorch CUDA. SM 12.x block-scaled FP4 MMA. Upstream parent: [ashhart/TensorFold](https://github.com/ashhart/TensorFold).
+Prepared activations are not row-major. `lane` checks activation scales as `(K/64, mpad, 4)`. The prompt path can swizzle codes. Gathering "row 0" of the scale tensor does not gather the scales for code row 0. The scheduler either quantizes BF16 rows into an expert-local prepared region, or gathers codes and scales with a layout id. It does not slice a packed buffer and hope.
 
-**Pin:** Implement against `56e2e3ec55bc0ae1d7d5158c4fa2c79a3567ab21`. Do not rebase onto a newer `main` as part of these tasks. An upstream move is a separate requalification: re-read every path this plan cites, then edit. Task 0 records the commit actually checked out.
+Decode and prefill share weights and the numeric meaning of a projection. They do not share a bitwise oracle. Decode uses the lane kernel and `split_k`. Prefill uses the prompt GEMM, which is a different reduction. Each is bitwise only against an eager oracle on that same backend.
+
+**Tech stack:** TensorFold 0.6.2 (Apache-2.0), base `56e2e3ec55bc0ae1d7d5158c4fa2c79a3567ab21`. PyTorch CUDA. Upstream: [ashhart/TensorFold](https://github.com/ashhart/TensorFold).
+
+**Pin:** Implement against that commit. Do not rebase onto a newer `main` inside these tasks. Record `HEAD`, dirty state, and the checkpoint revision in the manifest. An ancestor check is not enough: uncommitted edits are part of the manifest. A later upstream move is a new manifest and a targeted requalification.
 
 ---
 
@@ -24,574 +26,565 @@ Decode and prefill share the numeric contract and the weight layout. They do not
 
 Quality bar, in order:
 
-1. `nvidia/GLM-5.3-Flash-NVFP4` — official ModelOpt W4A4, recipe name `nvfp4_experts_dense_mlp-kv_fp8_cast`, producer `modelopt 0.47.0.dev393+ga4bc45b30.d20260828`. **This plan.**
+1. `nvidia/GLM-5.3-Flash-NVFP4` — ModelOpt W4A4, recipe `nvfp4_experts_dense_mlp-kv_fp8_cast`, producer `modelopt 0.47.0.dev393+ga4bc45b30.d20260828`. **This plan.**
 2. `RedHatAI/GLM-5.3-Flash-NVFP4` — compressed-tensors. **Not this plan.**
-3. EXL3 / TR3 4bpw — **out of scope.**
+3. EXL3 / TR3 — **out of scope.**
 
-The Hugging Face card's sentence "only sparse MoE shared experts and dense MLP are quantized" does not match the file. The recipe name and the index do: routed experts and dense MLPs carry scales; shared experts, attention, the router, embeddings, `lm_head`, and layer 45 do not. Trust the index.
+The model card's sentence that only shared experts and dense MLPs are quantized does not match the index. Routed experts and the three dense MLPs carry scales. Shared experts, attention, the router, embeddings, `lm_head`, and layer 45 do not. Trust a manifest-pinned index, not the card and not a floating `main`.
 
-Do not stop or unload the existing multi-request vLLM serve for this plan, for CPU tests, or to pull shards. Two copies of this model do not fit on the two Sparks (see Capacity). The comparison is a recorded reference, then a later TensorFold run. A single-stream win does not replace a server that already runs more than one request.
+One copy of the routed experts is about 171 GB. Two Sparks have 256 GB of unified memory together. Two resident copies do not fit, and CPU memory on those nodes is the same pool. The existing vLLM serve stays up. Comparison is record, then a later TensorFold run, inside an approved window that says how the previous serve is restored.
 
-### What an outside review changed
+### Reviews already accepted
 
-Checked against the pin on 2026-10-02. Accepted:
+Checked against the pin. Still in force:
 
-- Downs need their own rows. `matmul_group` cannot run them.
-- Device-indexed expert dispatch is required before any graph is called qualified. A device id buffer alone does not redirect a captured weight pointer.
-- Prefill packs token–expert pairs, runs the expert, and scatters back. It does not push every row through every expert that appears in the chunk.
-- `--no-drafts` does not skip MTP. `MTP_DEFAULT` is `"1"`. `mtp_head` honors `serial_only` only when `TF_GLM_MTP=auto`.
-- Bitwise equality is the contract when two paths use the same kernels and the same reduction order. Split-versus-unsplit and TensorFold-versus-vLLM are numerical comparisons with a written dtype and order, not bitwise tests. `qmm.split_k` depends on `n` and `k`, so a TP split can change the reduction.
-- `matmul` copies a rejected output back; `matmul_group` does not. `_out` drops a buffer that is noncontiguous or the wrong dtype.
-- Column-split legality is on the original packed width: `P % 64 == 0` before the split, so each rank's logical K (`P`) is a multiple of 64. `P % 32 == 0` lets `P = 96` through and then fails `Fp4Linear`.
-- The old ~80 tok/s figure is a MoE-only partial bound. BF16 KDA Q/K/V/O is more traffic than the routed experts. It is still not a whole-model ceiling.
-- One model copy per pair of Sparks. The harness records the reference and compares later.
-- The France prompt is a smoke test. Qualification compares teacher-forced next-token distributions, not retokenized strings.
-- A 32k timing run needs an explicit `--context`. The default window stays on the dense path.
+- Expert downs are distinct intermediates. `matmul_group` cannot run them.
+- Graphs need device-side weight selection. Recapture-per-token and copying selected weights into the capture are rejected.
+- Prefill packs assignments and scatters back. It does not run every row through every expert that appears in the chunk.
+- `--no-drafts` does not unload MTP. `MTP_DEFAULT` is `"1"`. `serial_only` matters only for `TF_GLM_MTP=auto`.
+- Bitwise equality is only for the same backend and the same reduction order. `qmm.split_k(n, k)` changes when a split changes `n` or `k`.
+- `matmul` copies a rejected destination back. `matmul_group` does not. `_out` drops a noncontiguous or wrong-dtype buffer.
+- Column-split rule: original packed width `P` satisfies `P % 64 == 0`, so each rank's logical K (`P`) is a multiple of 64. `P = 96` passes `% 32` and then fails `Fp4Linear`.
+- ~80 tok/s was a MoE-only partial bound. ~31 tok/s is a larger partial bound. Neither is a throughput target.
+- A 32k timing run needs an explicit `--context`. The default window stays dense.
+- No new MMA, no CUTLASS/FlashInfer dependency, no "Four Over Six" rescale (arXiv:2512.02010).
 
-Narrowed, not rejected:
+### What the third review adds
 
-- 31 tok/s is the streaming arithmetic for the partial table (experts + shared + dense MLP + head + router + KDA Q/K/V/O). It still omits the 11 sparse-attention projections, mHC, cache, and collectives. Do not treat 31 as the number the server should hit.
-- CPU loader and split work does not wait on a live vLLM process. The recorded reference is required before any serve comparison, and collecting it still needs the approval this plan already requires. It does not authorize stopping the current server.
-- FlashInfer issue 2723 is a historical SM120 grouped-GEMM failure, since closed. It is not a proof that every current CUTLASS build is wrong, and it is not a reason to vendor CUTLASS. The MMA stays `lane4.cu`.
-- "Four Over Six" (arXiv:2512.02010) changes the quantization recipe. It is not a way to match this checkpoint.
+Checked against `checkpoint.cpp` `lane` (one matrix, one alpha), `nvfp4q.cuh` `block_scale` (SATFINITE e4m3, multiply by zero when the scale byte is zero), `forward.Buffers` (`slots = top_k + 1`, prefill `ey` is bf16), and `geometry.py` (draft-head term `9/16` of a bf16 head, file is `src/tensorfold/cuda/geometry.py`).
+
+Accepted:
+
+- One owner for expert storage. Pointer table first. No second stacked copy.
+- A small CUDA/C++ dispatch wrapper is allowed and required. It is not a new MMA.
+- Prepared-row layout is an interface: logical M/K, padded M, code layout, scale layout, lifetime.
+- Prefill capacity is the worst-case assignment count plus tile padding, not the average of ~57 rows per expert.
+- Eight routed slots and the shared expert's ninth slot are different. The shared expert is not an entry in the NVFP4 table. Its combine weight is 1.
+- Decode and prefill each have their own eager oracle. A lane/prompt difference is not a scheduler bug.
+- Today's ModelOpt `main` is not the producer (`0.47.0.dev393`) and is not the vLLM activation kernel. Record both policies. Do not re-quantize stored weights to match a newer encoder.
+- SwiGLU rounds `g * sigmoid(g)` to bf16, then multiplies by clamped `u`, then rounds the product. It does not merely round the sigmoid.
+- Two graph tests: a primitive with supplied ids, and a full forward whose router produces the ids. Rows 1 and 4 are not the whole capture set (`GRAPH_ROWS` is 1..6).
+- Unset `TF_GLM_MTP` and explicit `1` stay distinguishable. Unsupported drafting is rejected before NCCL.
+- Top-k logprobs are not a full-vocabulary oracle. Missing evidence is `INSUFFICIENT_EVIDENCE`, not `MATCH`.
+- `m > 2ε` is a sufficient condition that the top token is stable. The converse is not a near-tie diagnosis.
+- Reference layer traces are captured before the reference is unloaded.
+- Admission accounts for the real NVFP4 allocations and drops the draft-head term this path does not allocate.
+- Launches use the manifest's snapshot, not a floating repository id. A `Range` request that returns a whole shard is aborted.
+- Qualification is a set of scoped statuses, not one `MATCH` bit.
+
+Narrowed:
+
+- Compute Sanitizer runs on the new dispatch and the packing kernels, on tiny fixtures. A skipped sanitizer is recorded, not treated as a pass. It is not required on every CPU commit.
+- Full prefill graph capture is not implied by decode graphs. The manifest says which prefill calls are captured.
+- CPU streams do not wait on a live reference. `BLOCKED_REFERENCE` stops parity claims, not loader work.
+- GPU kernels and real NCCL do not run on the machine that is serving the live model unless that window was approved.
 
 ---
 
-## What the checkpoint actually stores
+## What the checkpoint stores
 
-Measured 2026-10-02 from the public index and from safetensors headers plus the leading 8 KiB of `input_scale` values in `model-00001-of-00033.safetensors`. No shard body was pulled. Task 1 re-checks these facts against a pinned revision, not floating `main`.
+Measured 2026-10-02 from the public index, safetensors headers, and the leading 8 KiB of `input_scale` values in shard 1. No shard body was pulled. These are plan facts until Task 1 checks the pinned revision. A sample of shard 1 does not prove every shard.
 
-Official export: https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4
+Export: https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4
 
-- 147,661 tensors, 33 shards, `metadata.total_size` = 204,419,110,596 bytes (190.4 GiB).
-- `quant_method` `modelopt`, `quant_algo` `NVFP4`. Weights and the **global** activation factor are static. Group size 16. The per-16 e4m3 block scales of an activation are computed at runtime by `quant4` from the values in that block. They are not stored.
-- `kv_cache_scheme`: static FP8 (`num_bits` 8, `type` float). No KV scale tensor is in the index.
-- Text config: 45 layers, of which 34 are `linear_attention` and 11 are `deepseek_sparse_attention`. 3 dense MLP layers, then MoE. Hidden 4096, dense intermediate 12288, MoE intermediate 2048, 288 routed experts, 1 shared, top-8, `routed_scaling_factor` 2.5, `norm_topk_prob` true, scoring `sigmoid`, `moe_router_dtype` `float32`, `swiglu_limit` 10. Linear attention: 64 heads, head dim 128. `qk_rope_head_dim` 0, `kv_lora_rank` 512, `index_topk` 2048, vocab 154880, context 1,048,576, `num_nextn_predict_layers` 1.
+- 147,661 tensors, 33 shards, `total_size` 204,419,110,596 bytes (190.4 GiB).
+- `quant_method` `modelopt`, `quant_algo` `NVFP4`. The **global** activation factor is static. Group size 16. Per-16 e4m3 block scales of an activation are computed at runtime. They are not stored.
+- `kv_cache_scheme`: static FP8, no scale tensor in the index.
+- 45 layers: 34 `linear_attention`, 11 `deepseek_sparse_attention`. 3 dense MLPs, then 42 MoE layers. Hidden 4096, dense intermediate 12288, expert intermediate 2048, 288 routed experts, 1 shared, top-8, `routed_scaling_factor` 2.5, `norm_topk_prob` true, scoring `sigmoid`, `moe_router_dtype` `float32`, `swiglu_limit` 10. Linear attention 64 heads of dim 128. `qk_rope_head_dim` 0, `kv_lora_rank` 512, `index_topk` 2048, vocab 154880, context 1,048,576, one next-n layer.
 
-Names. There is no `weight_packed` and no `weight_global_scale`. Codes are `.weight` dtype `U8`. `format.scheme` returns `nvfp4` for `U8` weight plus `F8_E4M3` `weight_scale`.
+Codes are `.weight` dtype `U8`. There is no `weight_packed` and no `weight_global_scale`. The global weight scale is scalar `weight_scale_2`. The global activation factor is scalar `input_scale`. Gate and up may share `input_scale` and must keep distinct `weight_scale_2` values. Shard 1 showed one gate scale per layer, bitwise-equal up scales (697/697), and a different down scale. Task 6 compares one reference value per layer across experts **and** shards. A disagreement stops the load.
 
 | Tensor | Stored shape | Logical GEMM |
 | --- | --- | --- |
-| Expert `gate_proj` / `up_proj` `.weight` | `U8 [2048, 2048]` | `[2048, 4096]`, low nibble first |
-| Expert `gate_proj` `.weight_scale` | `F8_E4M3 [2048, 256]` | one e4m3 per 16 K |
-| Expert `down_proj` `.weight` | `U8 [4096, 1024]` | `[4096, 2048]` |
-| Expert `down_proj` `.weight_scale` | `F8_E4M3 [4096, 128]` | |
-| Dense layer-0 `gate_proj` `.weight` | `U8 [12288, 2048]` | `[12288, 4096]` |
-| Dense layer-0 `down_proj` `.weight` | `U8 [4096, 6144]` | `[4096, 12288]` |
-| `weight_scale_2`, `input_scale` | `F32 []` | per projection, replicate on both ranks |
-| Shared expert `gate_proj` | `BF16 [2048, 4096]` | not NVFP4 |
-| Router `mlp.gate` | `BF16 [288, 4096]` in the file | config asks for fp32 scores |
-| Layer 45 expert `gate_proj` | `BF16 [2048, 4096]` | 889 tensors, none scaled |
+| Expert gate/up `.weight` | `U8 [2048, 2048]` | `[2048, 4096]` |
+| Expert gate `.weight_scale` | `F8_E4M3 [2048, 256]` | one e4m3 per 16 K |
+| Expert down `.weight` | `U8 [4096, 1024]` | `[4096, 2048]` |
+| Expert down `.weight_scale` | `F8_E4M3 [4096, 128]` | |
+| Dense layer-0 gate `.weight` | `U8 [12288, 2048]` | `[12288, 4096]` |
+| Dense layer-0 down `.weight` | `U8 [4096, 6144]` | `[4096, 12288]` |
+| `weight_scale_2`, `input_scale` | `F32 []` | replicate |
+| Shared expert gate | `BF16 [2048, 4096]` | not NVFP4 |
+| Router | `BF16 [288, 4096]` in the file | scores are fp32 |
+| Layer 45 expert gate | `BF16 [2048, 4096]` | 889 tensors, none scaled |
 
-`weight_scale_2` may differ per expert and between gate and up. Sharing `input_scale` does not license sharing the weight scale. SGLang issue 21802 is a different model in which a fused gate/up kept one global weight scale and dropped the other. This loader keeps one `Fp4Linear.scale` per projection.
+After TP=2, expert gate/up N is 1024 and expert down logical K is 1024. Dense down logical K is 6144. All of those are multiples of 64. `cfg.group_size` still defaults to 64 when the key is absent. Do not read it as 16.
 
-Shard 1 activation scales (2,092 scalars, 39 MoE layers, 18 experts each): one gate scale per layer, `up_proj` bitwise equal (697/697), one distinct down scale per layer. Examples: layer 3 gate = up = `0.001139323`, down = `0.037202381`; layer 44 gate = up = `0.007905507`. The loader asserts this on every shard and stops if a shard disagrees. That assertion allows one quant of the residual for every selected gate and up. It does not allow one quant of a single intermediate for every down.
+### Dataflow
 
-ModelOpt's global weight scale is passed through as stored. The reciprocal is the compressed-tensors path in `qwen3_5/cuda/nvfp4_load.py`. The global activation factor is `input_scale`, exported by ModelOpt as `amax / (6 * 448)`.
-
-### Routed dataflow
-
-For `R` tokens on one rank:
+`R` tokens, one rank. Routed width after the row split is 1024.
 
 | Object | Shape |
 | --- | --- |
 | Residual | `[R, 4096]` |
-| Expert ids | `[R, 8]`, plus the shared expert |
-| Gate and up outputs | `[R, 8, 1024]` after the TP row split |
-| Clamped SwiGLU | `[R, 8, 1024]`, each row its own vector |
-| Down partials | `[R, 8, 4096]` fp32, then the weighted sum into `b.part` |
+| Routed ids and weights | `[R, 8]` |
+| Shared slot | index 8, or a separate buffer. Not an NVFP4 expert id |
+| Gate/up | `[R, 8, 1024]` |
+| Clamped SwiGLU | `[R, 8, 1024]`, one vector per assignment |
+| Routed downs | `[R, 8, 4096]` fp32 |
+| Combine | slot order, shared contribution last at weight 1, into fp32 `b.part` |
 
-Gate and up: quantize `x` once under the layer gate scale, then each selected expert's own weights. Down: quantize the `R * 8` intermediate rows under the layer down scale (one launch is fine), then expert `e` reads only the rows that routed to `e`.
+SwiGLU, matching `glue.swiglu`:
 
-Prefill, for a 2,048-row chunk: `2048 * 8 = 16384` assignments. Spread across 288 experts that is about 57 rows per expert when routing is even, not 2,048. The order is: assignments, rows packed per expert, gate/up GEMM, quantize those packed rows, down GEMM, scatter back to `[R, 8, hidden]`, then the existing weighted combine. An empty expert launches nothing. A chunk where every row picks different experts still scatters correctly.
+```text
+g1 = min(g, 10)
+u1 = clamp(u, -10, 10)
+s  = round_to_bf16(g1 * sigmoid(g1))
+h  = round_to_bf16(float32(s) * u1)
+```
 
----
+Dense, shared, and routed paths each get a saturation test. `mlp_prompt` stays off: it runs epilogue 2, which does not clamp and keeps the product in fp32. Epilogue 1 rounds `u` to bf16 first, which is also not this sequence.
 
-## What upstream already does
+Prefill of 2048 rows has `2048 * 8 = 16384` assignments. Even routing is about 57 rows per expert. That is not the allocation bound. One expert can receive all 2048 rows. With tile padding `B`, a loose bound is `16384 + 288 * (B - 1)` (about 34,528 rows at B=64, about 52,960 at B=128). Admission uses the bound of the tile policy actually selected. A fixed graph may contain empty work descriptors. An empty expert does no matrix work and reads no expert rows. "Zero host launches" is not the requirement.
 
-Fork parent: https://github.com/ashhart/TensorFold/commit/56e2e3ec55bc0ae1d7d5158c4fa2c79a3567ab21
-
-`weights.load` rejects anything other than `mlx` and `exl3`. `Config.group_size` defaults to 64 when the key is absent; NVFP4's 16 lives in `config_groups`. Do not read `cfg.group_size` as 16. `bits_of` defaults a missing `bits` to 4, which this config survives.
-
-`QUANT_METHODS["cuda"]` is `("mlx", "exl3")`. `require_readable` rejects `modelopt` first. `check()` then treats it as a bad MLX `(4, 64)`. `tests/cuda/test_glm_split_and_policy.py` asserts that tuple. All three change together. Do not add `compressed-tensors`.
-
-`MTP_DEFAULT = "1"` in `cuda/engine.py`. `mtp_head` returns true for `"1"` even when `serial_only` is true. `"auto"` is the setting that turns the head off for `--no-drafts`. Unset, `--no-drafts` still loads layer 45. `tests/test_glm_mtp_setting.py` locks this. NVFP4 must not depend on the operator exporting `TF_GLM_MTP`. This quant refuses to load layer 45. `TF_GLM_MTP=1` on an NVFP4 checkpoint raises before NCCL, naming the head as unqualified. `0` and `auto` with `--no-drafts` load no layer-45 tensor and capture no MTP graph. Drafts disabled and MTP weights absent are both required; the flag alone is only the first.
-
-The EXL3 arm builds `draft_head = quantize4(head.weight)` even when `mtp` is false. The NVFP4 serial path does not. That copy is for draft steps.
-
-GLM CUDA is two ranks. `GlmEngine` constructs NCCL before the MTP check, captures graphs for rows 1..6 (`GRAPH_ROWS` includes 5 and 6 in the engine; `Graphs` defaults to 1..4 — follow the engine), and all-gathers fp32 `b.part` inside the capture. `gather` stacks rank-ordered partials; `hc_post` sums them rank 0 first. About two gathers per layer, about 90 per token, each one-row partial 16 KiB (`4096 * 4`). Latency of that many collectives is part of the profile, separate from GEMM time. Do not change the reduction dtype to make them faster.
-
-`serve_options.check` already raises `GLM-5.3-Flash image input is currently MLX-only` before the engine. `tests/test_vision_glm_config.py` locks that string. Do not add a second vision check, and do not construct `GlmEngine` in a CPU test (it calls `set_device` and NCCL immediately).
-
-Without `--context`, the window is `cfg.dense_limit` and attention stays dense (`engine.py`). A 32k prompt on the default launch is not a long-context run. `index_topk` is 2048, so the dense limit is `index_topk + index_kpool - 1`.
-
-EXL3 is the BF16 pattern for attention, norms, router storage, shared expert, embed, and `lm_head`: `make_b16` on `.weight`. The router multiplies bf16 operands and writes fp32 (`glue.router`). `glue.select` applies sigmoid, adds `e_score_correction_bias` for the choice, breaks ties toward the lower id, and normalizes the unbiased scores when `norm_topk_prob` is set, then multiplies by `routed_scaling_factor`. The shared expert is appended at weight 1. The config's `moe_router_dtype: float32` means the comparison against vLLM has to look at scores, not assume the bf16 matmul matches. Both ranks must pick the same ids before the partials are combined.
-
-`glue.swiglu`: `min(gate, 10)`, `clip(up, -10, 10)`, then `bf16(bf16(silu(gate)) * up)` with `up` still fp32 for the multiply. `checkpoint.mlp_prompt` runs SwiGLU epilogue 2 (`SWIGLU_FP32`), which does not clamp and keeps the product in fp32. Epilogue 1 rounds `up` to bf16 first, which is also not `glue.swiglu`. Fusion stays off.
-
-`checkpoint.matmul` re-quantizes, then copies into `out` when `_out` refused the buffer. `matmul_group` reuses one quant and does not copy back. `_out` accepts a buffer only when it is contiguous and the requested dtype. A multi-row slice of a stacked gate/up buffer can fail that test while a one-row view passes. The scheduler either rejects a bad buffer or copies back. It does not return a tensor the caller did not pass.
-
-`Buffers.ey` is bf16 on the prefill path. Down partials that will be reduced live in fp32. `glue.combine` already sums slot-major `y` in fp32 and notes that prefill `y` may be bf16; the NVFP4 path passes fp32 slot outputs so the combine does not round first.
-
-`experts.cu` is bf16 times dequantized FP4. Tests lock that. Flash Next calls it. This plan does not.
-
-Qwen and Flash Next refuse NVFP4 `--tp 2` (`one GPU`). Do not edit those tests.
-
-`split.py` has no `F8_E4M3`. `capacity.SIZES` and `direct_read.py` do. `rule()` raises if a name matches more than one class, so a scalar must return `"rep"` before the row/column scan. `RankReader` splits on the CPU (`split_bytes`) and on a CUDA prefetch (`split_device`), and a pre-split rank folder is a third path. Task 4 covers all three.
-
-`qmm.split_k(n, k)` depends only on shape. Halving `n` or `k` can change the slice count. Task 9 does not require bitwise equality between a split pair and an unsplit GEMM.
-
-`mla_geometry` stores the latent as `count * capacity * kv_lora_rank * 2` bytes on the rank, not divided by world. Eleven sparse layers, 32,768 tokens, width 512: about 352 MiB bf16 per rank, about 176 MiB if the latent were fp8. A 2,048-row chunk of fp32 down slots is `2048 * 8 * 4096 * 4 = 256 MiB` per rank before gate/up workspace. At 32k the expert scratch can exceed the fp8-latent saving. Account for both.
-
-`Weights.nbytes` does not walk an `Fp4Linear`. Admission uses `split_weights(rule)` plus `mla_geometry`. NVFP4 scratch has to be added there the way EXL3 scratch already is. A post-load snapshot is not a prefill budget.
+Eight fp32 slots at R=2048 are 256 MiB. Nine are 288 MiB. The existing nine-slot bf16 `ey` is another 144 MiB if it stays allocated. Pick one representation in Task 11A and do not add 256 MiB on top of the old buffer without saying why both exist.
 
 ---
 
-## Traffic model
+## Numeric policy
 
-These are streaming calculations: one decoded token, one DRAM read of each listed matrix, TP=2, 273 GB/s from the DGX Spark hardware guide. They are not measured traffic and not a throughput target. NVIDIA's 273 GB/s is a spec, not a sustained rate.
+Write this to `docs/plans/notes/nvidia-glm-nvfp4-numeric-policy.json` in Task 0A. Implementation checks the file; it does not invent a tolerance after seeing the candidate.
 
-Per routed expert, codes plus block scales: `3 * (2048*2048 + 2048*256) = 14,155,776` bytes. Top-8 across 42 MoE layers, half a tensor per rank: **2.378 GB/token/rank**. All 288 experts resident, not per token: `42 * 288 * 14,155,776 ≈ 171.2 GB` per complete copy. Two copies are about 342 GB, and two Sparks have 256 GB of unified memory between them. A second copy on CPU on those nodes is the same memory. The reference and TensorFold do not run together.
+| Stage | Policy |
+| --- | --- |
+| Stored codes and scales | Exact after packing and splitting. Padding is separate. |
+| Global activation factor | Stored `input_scale`. Not recomputed from the activation. |
+| Runtime block scales | TensorFold `block_scale`: e4m3 via SATFINITE, multiply by zero when the scale byte is 0. ModelOpt `main` clamps tiny block scales toward `2**-9` before the cast. Those policies are named, not assumed identical. A zero block that is byte-different but numerically zero is not by itself a broken load. A nonzero-value difference is investigated before parity is claimed. |
+| Gate/up | FP4×FP4, bf16 production output. |
+| Down | FP4×FP4, fp32 partial. |
+| Combine | Selected-slot order, shared last at weight 1. |
+| TP sum | fp32 partials, rank 0 first, as `gather` / `hc_post` do now. |
+| Head | Record compute dtype, vocab order, and padding. Widening bf16 to fp32 for storage is labeled as widening. |
+| Cache | bf16 latent unless a later task qualifies a known fp8 writer. |
+
+Two reference levels, kept apart:
+
+1. A small logical E2M1/E4M3 encoder in the test, with its rounding and zero policy written down. Not a second call to `quant4`. Not a copy of today's ModelOpt `main` treated as the producer.
+2. The eager TensorFold kernel on the same backend as the candidate (lane for decode, prompt GEMM for prefill).
+
+A high-precision dot product of the **decoded quantized operands** is a primitive reference. It is not a substitute for the runtime kernel, and an unquantized bf16 model is not the W4A4 oracle.
+
+| Comparison | Rule |
+| --- | --- |
+| Checkpoint to packed weights | Exact codes, scales, and which scalar is which |
+| Eager to device dispatch, same backend | Bitwise |
+| Eager to graph, same state | Bitwise |
+| TP split to unsplit | Named envelope. `split_k` recorded on both shapes. Not bitwise |
+| Decode to prefill | Envelope, unless the test shows the same reduction |
+| TensorFold to vLLM | Same inputs, observation type named, envelopes frozen before the candidate is scored |
+
+Let `ε` be the max absolute error over the **full** observed vocabulary, and `m` the reference top-1 minus top-2 margin. If `m > 2ε`, the candidate must keep that top token. If `m <= 2ε`, the bound is inconclusive. It is not evidence of a benign near-tie. A near-tie label requires the error itself to sit inside an envelope that was fixed before this run, and no earlier defect. Any emitted-token difference still fails token parity. A top-k logprob vector is not `ε`.
+
+Router checklist, because a miss here is not an NVFP4 bug: bf16 matmul into fp32 scores, sigmoid, bias added for the choice only, lower-id tie break, normalize unbiased scores when `norm_topk_prob` is set, then `routed_scaling_factor`. Both ranks must pick the same ids. Do not broadcast one rank's ids to hide a mismatch. mHC constants, KDA state, indexer parameters, and head dtype are on the same checklist. Record code defaults, not only `config.json`.
+
+---
+
+## Capacity and traffic
+
+Calculations, not measurements. DGX Spark: 128 GB unified, 273 GB/s ([hardware guide](https://docs.nvidia.com/dgx/dgx-spark/hardware.html)). The 273 GB/s figure is a spec, not a rate every kernel sustains.
+
+| Quantity | Result |
+| --- | --- |
+| One routed expert, codes plus block scales | 14,155,776 bytes |
+| Routed experts resident per rank | 79.734375 GiB |
+| One MoE layer of those, per rank | 1.8984375 GiB |
+| Routed traffic, top-8, 42 layers, per token per rank | 2.378 GB |
+| Routed plus shared expert traffic | 3.435 GB/token/rank |
+| Partial token model in the table below | 8.859 GB/token/rank |
+| Draft-head term this path must not keep | about 170 MiB/rank (`vocab/2 * 4096 * 9/16`) |
+| 256 full-vocab fp32 vectors on disk | 151.25 MiB |
 
 | Component | GB/token/rank |
 | --- | ---: |
-| Top-8 routed experts, 42 layers, NVFP4 | 2.378 |
+| Top-8 routed experts, 42 layers | 2.378 |
 | BF16 shared experts, 42 layers | 1.057 |
 | Three dense NVFP4 MLPs | 0.127 |
-| BF16 `lm_head` (vocab/2) | 0.634 |
+| BF16 head (vocab/2) | 0.634 |
 | BF16 routers | 0.099 |
 | BF16 KDA Q, K, V, O, 34 layers | 4.563 |
 | Partial sum | 8.859 |
 
-KDA: `34 * 4 * 4096 * (64 * 128) * 2 / 2 = 4.563 GB`. `273 / 8.859 ≈ 31` tokens/s if nothing else moved and every kernel hit the spec bandwidth. The 11 sparse-attention projections, the extra KDA projections (`f_a`, `g_a`, `b`, conv), mHC, the latent, and ~90 collectives are not in the table. The old 3.4 GB / ~80 tok/s figure is the MoE-plus-shared subtotal only. Use it when profiling the expert kernel. Do not divide a full-token measurement by 3.4 GB and call the result efficiency.
+`273 / 8.859 ≈ 31` tokens/s only if that list were the whole token and every byte moved once at the spec rate. The 11 sparse-attention projections, the smaller KDA projections, mHC, the latent, and about 90 collectives of 16 KiB are not in the sum. Report a modeled byte-rate only with its numerator. Do not call `tok/s * 2.378e9 / 273e9` an efficiency unless the timer covered only those expert GEMMs.
 
-Layer 45, if it were loaded: 288 BF16 experts, three `[2048, 4096]` matrices, half per rank, about **6.75 GiB/rank** before the rest of that layer. This plan does not load it.
+Layer 45, if loaded, is about 6.75 GiB/rank of BF16 expert weights. This plan does not load it.
 
-A decode that launches `42 * 8 * 3 = 1008` expert GEMMs per token pays launch overhead on top of the bytes. Quantizing the residual once saves a few kilobytes of activation traffic. The bytes that matter are the KDA projections and the expert weights. Order of work: correct device-indexed scheduler and the packed-prefill quantizer, then measure launch gaps and achieved bandwidth on the TP-local shapes, and in the same profile time the BF16 KDA GEMMs, the head, and the collectives. A clamped SwiGLU fusion is allowed only after it matches `glue.swiglu` on the same rows, including the bf16 rounding of the sigmoid. Do not retune `split_k` without rerunning the numerical check. Do not assume a Qwen tile choice is right for `N` in `{1024, 2048, 4096, 6144}`.
-
-Same-checkpoint TensorFold numbers that are not this model: Qwen3.8-27B NVFP4 decode 1.4–2.0× vLLM on one RTX PRO 6000 (`CHANGELOG` 0.6.1); Flash Next NVFP4 1.13–1.52× on one Spark, W4A16 experts (`CHANGELOG` 0.3.6.3). Do not copy either ratio into the GLM recipe. The MLX GLM table in `docs/recipes/glm-5.3-flash.md` is the wrong quant.
-
-The model card's vLLM command is TP 4 with expert parallel on GB200-class hardware, image tag `glm53-flash-arm64-cu130`. The tag names an architecture and a CUDA build. It does not by itself prove SM 12.1. The speed denominator is vLLM `--tp 2` on the same two machines, recorded, not a four-GPU number. vLLM 0.22.1's NVFP4 clamp allow-list is `FLASHINFER_TRTLLM` while the error text also names CUTLASS; later `main` is wider and warns that shape-specific fallbacks still happen. Record the backend the process actually ran, for prefill and for decode. A startup line is not proof the activations stayed FP4.
+Eleven sparse layers, 32,768 tokens, latent width 512, replicated per rank: about 352 MiB bf16, about 176 MiB if the latent were fp8. Expert-slot scratch at R=2048 can exceed that saving. `mla_geometry` does not divide the latent by world.
 
 ---
 
-## KV cache and context
+## Evidence
 
-Do not invent a KV scale. The scheme says static FP8 and the index has no scale tensor. TensorFold's latent is bf16, width 512, rope dimension 0, replicated on each rank.
+Observation types, and nothing else:
 
-The comparison manifest records the reference cache dtype, layout, and whether `--kv-cache-dtype bfloat16` starts. If both sides can run bf16, the first numerical compare uses bf16 so a bad GEMM is not mixed with a cache cast. If the reference is fp8 only, stop and write down the writer (scale, layout, whether the 512-d latent is what is stored) before adding a cast. Matching the dtype string is not enough: latent layout, KDA conv and recurrent state, indexer pools, and prefix reuse have to be named. A September 2026 study of GLM-5.3-Flash hybrid-state restore (arXiv:2609.15030) found a full-hit mismatch where restored state covered the prompt and the scheduler credited one fewer token. That run was RedHat NVFP4 at TP 4. It is a failure mode to test, not a result for this port.
+`TOKEN_IDS_ONLY`, `TOPK_LOGPROBS`, `FULL_VOCAB_LOGPROBS`, `FULL_VOCAB_RAW_LOGITS`, `INTERNAL_LAYER_TRACE`.
 
-Tests, once a serve exists: cold versus prefix reuse, a continuation after an unrelated request, reset, and lengths around the dense limit and the prefill chunk. Short dense completions do not qualify the sparse path.
+Missing fields are `INSUFFICIENT_EVIDENCE`. The comparator does not retokenize text, does not fill missing probabilities with zeros, and does not treat top-k logprobs as a full-vocabulary max error. Full logprobs are not raw logits. Widening bf16 head outputs into fp32 is labeled.
 
-FP8 latent is in scope for the long-context configuration after the writer is known. It is not a substitute for the 256 MiB expert-slot scratch.
+Statuses, separate fields: `CONFIG_PASS`, `LOAD_PASS`, `PRIMITIVE_PASS`, `ROUTED_PASS`, `GRAPH_PASS`, `TP_PASS`, `DENSE_FIDELITY_PASS`, `LONG_CONTEXT_FIDELITY_PASS`, and failures `DIVERGE`, `INSUFFICIENT_EVIDENCE`, `BLOCKED_REFERENCE`, `UNSUPPORTED_MODE`. A token-parity pass with no full-vocabulary observations does not publish a recipe claim. Diagnostic timings before fidelity are allowed and labeled unqualified.
 
----
+Package layout (Task 0A creates the readers; Task 12 fills a real package only in an approved window):
 
-## Numerical contracts
+```text
+reference/<manifest_id>/
+  manifest.json
+  numeric_policy.json
+  capture_capabilities.json
+  observations.jsonl
+  tensors/<case>.<stage>.<position>.<rank>.safetensors
+  checksums.sha256
+```
 
-Three different comparisons:
+No pickle. Synthetic or public prompts only. Before a reference process exits, the package that was actually authorized includes the boundaries the comparator will need later: router ids and weights, selected gate/up, post-SwiGLU, down partials or the combine, and the head vector type that the server can really return. A missing probe is written down. It is not reconstructed after the process is gone.
 
-| Contract | Requirement |
-| --- | --- |
-| Load and pack | Exact codes, scales, shapes, and which scalar is `weight_scale_2` versus `input_scale` |
-| Scheduler versus the eager per-expert oracle, same order | Bitwise on the fp32 partial |
-| TP split versus unsplit, or TensorFold versus vLLM | Written dtypes and reduction order, plus max absolute error, RMS, and top-2 margin. Not bitwise |
-
-`split_k` may differ after a split. Say so in the Task 9 note. A token change with a top-2 margin below twice the logit error is a near-tie, recorded as such. It still fails a token-parity claim. It is not by itself a wrong load. The plan stops on an unexplained divergence; the harness has to show which layer moved first.
-
-Declared NVFP4 order: gate/up bf16 out of the MMA (or fp32 if a test asks), `glue.swiglu` as written, down accumulation fp32, combine in slot order with the shared expert last at weight 1, TP sum of fp32 partials rank 0 first.
-
-Quantizer tests, against a small independent reference (the ModelOpt scale and round rules, or a few dozen lines that implement them, not a second call to `quant4`): zeros, values under the smallest e4m3 scale, midpoint ties, saturation at 6, non-unit global scales, and values around the SwiGLU clamp. "Diagnosing FP4 inference" (arXiv:2603.08747, Qwen2.5, not GLM) found up and down projections sensitive, including early layers. Probes on a divergence start at layers 0–2 and at the first MoE layer's up / SwiGLU / down, not only at the last layer.
+First-difference order when a compare fails: checkpoint bytes, then activation codes, then same-operand GEMM, then device ids versus eager, then prefill versus decode, then graph versus eager, then rank disagreement, then the reduction, then anything upstream of the quantized MLP (KDA, norms, mHC, cache), then repeated-request state, then long context, then the head. Do not start at the KV writer. Do not call a short dense match a sparse-attention qualification.
 
 ---
 
-## Non-goals
+## Work streams
 
-- No new MMA. A device-indexed launch that calls `lane4` / `gemm_ck` is in scope. A new numeric recipe is not.
-- No CUTLASS, FlashInfer, or TensorRT-LLM dependency.
-- No `experts.cu` for this checkpoint.
-- No EXL3 work, no RedHat loader, no Apple NVFP4.
-- No vision serve.
-- No DFlash2 pull, and no layer-45 load. `incoai/GLM-5.3-Flash-DFlash2` is CC BY-NC-ND 4.0.
-- No expert parallelism and no `--parallel`.
-- No second resident copy, no shard pull, and no exclusive window until the task says so.
-- No MLX or EXL3 TensorFold serve in the comparison.
-- No "Four Over Six" rescale of this checkpoint.
+One orchestrator. The other roles are sub-agents with a file list. A coder does not review their own change. A reviewer reads the diff against this document and does not quietly add a feature. A tester owns the test file, runs the command, and reports a status from the list above. GPU work does not use the GPUs of the live serve unless the orchestrator has an approval that names the restore steps.
 
----
+The orchestrator may start a stream only when its "needs" line is met. Streams in the same window edit disjoint files. `weights.py` and `forward.py` are sequential: the policy stream lands the refusal, the load stream replaces the loader branch, the numerics stream wires eager forward, the kernel stream wires the device path. Two coders do not edit those files at once.
 
-## Stop conditions
+| Stream | Role | Owns | Window | Needs |
+| --- | --- | --- | --- | --- |
+| O | Orchestrator | `docs/plans/notes/*manifest*`, status record, merge order | 0 onward | nothing |
+| E | Evidence coder, then tester | `tools/glm_nvfp4_record.py`, `tools/glm_nvfp4_compare.py`, schema tests | 0 | nothing |
+| P | Policy coder, reviewer, tester | `glm5_next/__init__.py`, new `cuda/nvfp4_policy.py`, `tests/cuda/test_glm5_nvfp4_config.py` | 0–1 | Task 0 identities for the manifest fields; Task 2 can start on today's tree |
+| C | Census (orchestrator or one fetcher) | `docs/plans/notes/nvidia-glm-nvfp4-index.md` | 1 | Task 0 checkpoint revision |
+| R | Recon, read-only | feasibility note only | 1 | a reference that is already up, or an honest `BLOCKED_REFERENCE` |
+| S | Split coder, tester | `cuda/split.py`, `tests/cuda/test_glm5_nvfp4_split.py` | 2 | Task 1 shapes |
+| Q | Quant coder, tester | `tests` for the logical encoder, `cuda/nvfp4` prepared-row helper, one-projection loader | 2–3 | Task 4 for real shapes; 5A can start with no loader |
+| M | Memory designer | `src/tensorfold/cuda/geometry.py` inventory, no kernel edits | 2, before Task 6 | the pointer-table decision in this plan |
+| L | Load coder, tester | `cuda/nvfp4_load.py`, the `modelopt` branch of `cuda/weights.py` | 3 | Tasks 3, 5C, 11A |
+| N | Numerics tester, with a coder for `forward.py` eager path | `cuda/nvfp4_moe.py` oracle, eager tests | 3–4 | synthetic `Fp4Linear` from Q; full layer from L |
+| K | Kernel coder, reviewer, sanitizer tester | new dispatch `.cu`/binding next to `checkpoint.cpp`, not a new MMA file that reimplements `mma_fp4` | 4 | Task 5B layout, Task 8 projection oracle |
+| D | Distributed tester | two-process tests on the existing comm wrapper | 4 | approval if those processes need the live GPUs; otherwise a CPU `comm=` seam |
+| G | Graph tester | `cuda/graphs.py` only if capture assumptions break, plus graph tests | 5 | Task 10B |
+| Pub | Orchestrator | recipe text | last | structured statuses, not a Markdown `MATCH` |
 
-- The pinned index disagrees with the census table, or a shard's `input_scale` is not layer-wide for gate=up and for down.
-- A split cuts a group of 16, leaves a rank with logical K not a multiple of 64, or splits a scalar.
-- The device scheduler does not match the eager oracle bitwise on the fp32 partial, including a second routing and a chunk whose rows disagree.
-- The only graph strategy left is recapture-per-token or copying selected expert weights into the capture buffer.
-- Teacher-forced token distributions diverge and the layer trace does not explain it. Do not lengthen the prompt to average a token-0 miss.
-- Continuing requires stopping the existing vLLM serve before the record/compare harness exists.
-- The work needs an MMA other than `lane4.cu` / `gemm_ck.cu` / `gemm_ws.cu`.
+Windows:
 
----
+0. O writes the manifest. E builds the comparator on synthetic records. P writes the refusal tests and the CPU policy function. No GPU, no shards.
+1. C confirms the census. R inspects a reference only if that does not restart it. P admits the recipe. E stays on synthetic failures.
+2. S splits. Q writes the logical quantizer (5A) in parallel. M writes the allocation inventory (11A) before anyone stacks tensors.
+3. Q finishes prepared rows and one projection. L loads experts into the pointer table. N writes eager oracles on synthetic linears.
+4. K lands one device-indexed projection and runs sanitizer on a tiny fixture. N extends oracles to unequal experts. D runs the two-process smoke test when GPUs are allowed.
+5. K finishes routed decode and packed prefill. G runs primitive and full-forward graph tests.
+6. Approved window only: record the reference, unload only as the approval says, run the candidate, restore the previous serve.
+7. Long context, then scoped timings. Publication reads the status record.
 
-## Files
-
-Create:
-
-- `docs/plans/notes/nvidia-glm-nvfp4-manifest.md` — commits, checkpoint revision, config hash, reference command once known
-- `docs/plans/notes/nvidia-glm-nvfp4-index.md`
-- `src/tensorfold/families/glm5_next/cuda/nvfp4_load.py`
-- `src/tensorfold/families/glm5_next/cuda/nvfp4_moe.py` — eager oracle, device table, prefill pack/scatter
-- `tests/cuda/test_glm5_nvfp4_config.py` (CPU)
-- `tests/cuda/test_glm5_nvfp4_split.py` (CPU, plus the CUDA prefetch test)
-- `tests/cuda/test_glm5_nvfp4_loader.py`
-- `tools/glm_nvfp4_record.py` and `tools/glm_nvfp4_compare.py`
-
-Modify only as the tasks say:
-
-- `src/tensorfold/families/glm5_next/__init__.py` — `modelopt` in `QUANT_METHODS["cuda"]` and in `check()`
-- `cuda/weights.py` — admit `modelopt`; BF16 arms for attention and shared expert; no `draft_head` on this path; prefetch the NVFP4 suffixes
-- `cuda/split.py` — `F8_E4M3`; scalars return `rep` first; logical-K check
-- `cuda/engine.py` — NVFP4 does not load MTP; `TF_GLM_MTP=1` refuses
-- `cuda/forward.py` — dense `Fp4Linear`; MoE through `nvfp4_moe`; fp32 slot outputs
-- `cuda/geometry.py` — NVFP4 workspace in `mla_geometry` when the quant is modelopt
-- `src/tensorfold/cuda/nvfp4/checkpoint.py` — output-buffer contract only if the scheduler uses `matmul_group` for same-input projections. Do not stretch `matmul_group` to many inputs.
-- Recipes only after a qualified run
-
-Do not weaken `test_qwen27_nvfp4.py`, `test_flashnext_nvfp4_loader.py`, `test_quant_family_formats.py`, `test_exl3_format.py`, `test_glm_exl3_bits.py`, `test_glm_mtp_setting.py` (the default stays `"1"` for MLX and EXL3), or `test_vision_glm_config.py`.
+A reviewer blocks a window when any of these is true: a second copy of expert storage, `matmul_group` on expert downs, `experts.cu` on this path, MTP loaded, a tolerance raised to fit the candidate, a `MATCH` from top-k logprobs, a graph test that only pokes ids after the router has already overwritten them, or a launch of floating `main`.
 
 ---
 
-### Task 0: Freeze the manifest
+## Tasks
 
-**Objective:** A note names the exact tree and the exact checkpoint revision this work is about. No rebase, no shard pull, no serve change.
+Each task ends in a commit of code and tests, or an evidence note. A blocked GPU gate can commit a report. It cannot turn on an unqualified serve.
 
-Write `docs/plans/notes/nvidia-glm-nvfp4-manifest.md` with:
+### Task 0 — Manifest
 
-- `git rev-parse HEAD` and whether `56e2e3ec55bc0ae1d7d5158c4fa2c79a3567ab21` is an ancestor. If it is not, stop. Do not rebase in this task.
-- The Hugging Face revision for `nvidia/GLM-5.3-Flash-NVFP4` (the commit the API returns for `main` on this day), the sha256 of `config.json`, and `total_size`. Fetch with a revision URL once you have the commit, not a second floating `main` later.
-- A line that the reference server has not been inspected yet, so kernel, cache, and clamp fields are blank until Task 12.
+Orchestrator. No shard pull.
+
+`docs/plans/notes/nvidia-glm-nvfp4-manifest.md` and a JSON twin. Fields: base commit `56e2e3e…`, `HEAD`, dirty flag, patch hash if dirty, checkpoint commit from the Hub, sha256 of `config.json` and of the index, tokenizer hash, world size 2, cache policy unknown, reference status `NOT_INSPECTED`. Unknowns are null with a reason.
+
+The parser rejects a missing identity, a hash mismatch, world size other than 2, and a numeric policy that contradicts the table above.
 
 ```bash
-git add docs/plans/notes/nvidia-glm-nvfp4-manifest.md
 git commit -m "docs: pin the GLM NVFP4 tree and checkpoint revision"
 ```
 
----
+### Task 0A — Comparator
 
-### Task 1: Confirm the census against that revision
+Stream E. No weights, no CUDA.
 
-**Objective:** The index at the manifest's revision still matches the table. No loader code.
+Schema, observation enum, and comparator. Synthetic tests: full-vocab logits, full logprobs, top-k only, missing token ids, nonfinite values, vocab mismatch, truncated file, a large corrupt logit vector that satisfies `m <= 2ε` and must not be labeled a near-tie. Top-k evidence fails a requested full-distribution gate. Text is never retokenized into ids.
 
-Re-fetch `model.safetensors.index.json` from that revision. Confirm 147661 tensors, 33 shards, `total_size` 204419110596, `weight_packed` 0, `weight_global_scale` 0, layer 45 present and unscaled. Range-read the header of `model-00001-of-00033.safetensors` and confirm expert 0 gate is `U8 [2048, 2048]`, scale `F8_E4M3 [2048, 256]`, `input_scale` `F32 []`.
+```bash
+git commit -m "test: offline comparator for GLM NVFP4 reference records"
+```
 
-If a count moved, stop and update this plan before Task 2. Paste the counts into `docs/plans/notes/nvidia-glm-nvfp4-index.md`.
+### Task 0B — Reference feasibility
+
+Stream R. Read-only. If the running server is a different checkpoint, it is not the oracle: write `BLOCKED_REFERENCE` and the exact gap. If it is this export, record image digest, package versions, GPU capability, clamp, cache, the MoE backend line for prefill and for decode, and whether activations stayed FP4. Absence of a log line is not proof of a backend. Do not restart it.
+
+CPU streams continue either way. Parity does not.
+
+### Task 1 — Census
+
+Stream C. Re-fetch the index and `config.json` at the manifest revision. If a `Range` response is the whole shard, abort. Confirm 147661 tensors, 33 shards, `total_size` 204419110596, `weight_packed` 0, layer 45 present and unscaled, and the representative shapes in the table (dense, routed, shared, router, head). Header and the small `input_scale` sample are not a full checksum.
+
+A count change stops loader work until this plan is updated. Do not delete caches to make room.
 
 ```bash
 git commit -m "docs: census nvidia GLM-5.3-Flash NVFP4 tensors"
 ```
 
----
+### Task 2 — Lock refusals, CPU seam
 
-### Task 2: Lock today's refusals
-
-**Objective:** CPU tests fail closed on ModelOpt at `require_readable`, `check()`, and `load`.
-
-The fixture is a complete `Config.read` document (`layer_types`, vocab, norms, LoRA ranks, expert fields, `routed_scaling_factor`, `eos_token_id`) plus `quantization_config` (that key, not `quantization`: `config_block` only reads `quantization_config`). Quant block: `quant_method` `modelopt`, `quant_algo` `NVFP4`, group 16, static float4 weights and activations, the producer version above.
-
-Tests: `scheme` on `.weight` `U8` plus `weight_scale` `F8_E4M3` is `nvfp4`. `require_readable` raises. `check()` raises. `load(..., rank=0)` raises `MLX 4-bit or EXL3` once the fixture reaches that line. `rank` is keyword-only.
+Stream P. Complete `Config.read` fixture using `quantization_config`. Today's `require_readable`, `check()`, and `load` still refuse `modelopt`. Add `nvfp4_policy.py` with a pure function of the raw environment and the flags, so tests never construct `GlmEngine`. A missing unrelated config field must not make a refusal look like a pass.
 
 ```bash
-python -m pytest tests/cuda/test_glm5_nvfp4_config.py -q
 git commit -m "test: lock GLM CUDA refusal of ModelOpt NVFP4"
 ```
 
----
+### Task 3 — Admit this recipe only
 
-### Task 3: Admit the recipe, not only the method name
-
-**Objective:** `modelopt` passes the family gate only when the block is static NVFP4, group 16, float weights and activations. `load` says the tensors are not wired. `compressed-tensors` still dies.
-
-`QUANT_METHODS["cuda"]` gains `"modelopt"` only. `check()` accepts `quant_algo == "NVFP4"` with group 16 and `dynamic: false` on both weights and activations. Anything else raises a message that names the missing field. Do not send it through the MLX `(4, 64)` test.
-
-Update `tests/cuda/test_glm_split_and_policy.py` so the tuple includes `modelopt`. A compressed-tensors fixture still raises. `load` of the good fixture raises `NVFP4 tensors are not wired`.
+Stream P. `QUANT_METHODS["cuda"]` gains `"modelopt"` only. Update `tests/cuda/test_glm_split_and_policy.py`. Accept static NVFP4, group 16, float weights and activations. Reject compressed-tensors, W4A16, integer codes, a wrong group, dynamic activations, and a non-finite global factor. `load` still raises `NVFP4 tensors are not wired`. Do not fall through into a bf16-activation expert path.
 
 ```bash
-python -m pytest tests/cuda/test_glm5_nvfp4_config.py tests/test_glm5_next_family.py tests/cuda/test_glm_split_and_policy.py tests/test_quant_family_formats.py -q
 git commit -m "feat: admit the NVIDIA NVFP4 recipe in the GLM family gate"
 ```
 
----
+### Task 4 — Splits
 
-### Task 4: Split codes, scales, and scalars
+Stream S. Scalars return `"rep"` before the row/column scan. `F8_E4M3` in both dtype maps. Original packed width `P % 64 == 0` for a TP=2 column split. `P = 96` raises. Do not pad.
 
-**Objective:** `rule`, `split_bytes`, and `split_device` agree on this export. A pre-split rank folder round-trips.
-
-Return `"rep"` for `input_scale` and `weight_scale_2` before the row/column scan. `.weight` and `.weight_scale` keep today's row rule for gate/up and column rule for down. Add `F8_E4M3` (1 byte, `torch.float8_e4m3fn`) to `DTYPE_BYTES` and `torch_dtype`.
-
-Column split: let `P` be the original packed column count. Logical K is `2P`. After TP=2 each rank's logical K is `P`, so require `P % 64 == 0` on the original tensor. `P % 32 == 0` is the wrong test (`P = 96` yields logical K 96). Do not pad.
-
-Tests:
-
-- Expert gate `U8 [2048, 2048]` row-splits to `[1024, 2048]`; scale `[2048, 256]` to `[1024, 256]`.
-- Expert down `U8 [4096, 1024]` column-splits to stored `[4096, 512]` (logical K 1024); scale `[4096, 128]` to `[4096, 64]`.
-- Dense down `U8 [4096, 6144]` column-splits to stored `[4096, 3072]` (logical K 6144).
-- Scalars `[]` replicate, and `rule` does not call them ambiguous.
-- Original packed width 96 raises.
-- The same bytes come out of `split_device`.
-- Write a one-tensor rank folder with `split_file` and read it back through `RankReader`.
-
-Run this file plus `tests/test_cuda_capacity.py` and `tests/test_cuda_geometry.py`.
+Tests: the real gate/up and down shapes, distinct bytes in each K group, non-unit scalars staying `[]`, `split_bytes` and `split_device` agreeing, and a rank folder whose metadata records source revision, format version, world, rank, shapes, dtype, axis, and scalar policy. Wrong rank, wrong world, stale revision, and truncated files fail before GPU work. CPU, device, and folder paths reconstruct the same codes and scales. Run `tests/test_cuda_capacity.py` and `tests/test_cuda_geometry.py`.
 
 ```bash
 git commit -m "feat: split GLM NVFP4 tensors on groups the kernel can use"
 ```
 
----
+### Task 5 — Quantizer, prepared rows, one projection
 
-### Task 5: Quantizer reference, then one dense projection
+Stream Q.
 
-**Objective:** `quant4` matches an independent scale-and-round on the cases in Numerical contracts. One dense projection becomes an `Fp4Linear` with `act=input_scale` and `scale=weight_scale_2` (not the reciprocal).
+5A. Logical encoder in the test. Cases: zero blocks, tiny maxima, subnormal-scale edges, E2M1 ties, negatives that round to zero, saturation, non-unit globals, nonfinite inputs. Failures say whether codes, scales, or reconstructed values moved. Do not treat ModelOpt `main` as the producer.
 
-The independent reference is a short function in the test, transcribed from ModelOpt's global factor and e4m3-per-16 rule, not a call into `quant4`. Cover the cases listed above.
+5B. `PreparedRows`: logical rows, logical K, padded rows, code layout id, scale layout id, storage, activation factor, owner. `quantize_into` an explicit buffer. Round-trip at a nonzero offset, a padding boundary, and two rows with different block scales. Reject an unknown layout. Do not gather scale axis 0 as if it were the row axis.
 
-Loader tests, names from the census (`layers.0.mlp.gate_proj.weight` and the three siblings):
+5C. One dense projection via `Fp4Linear.from_checkpoint`, `act=input_scale`, `scale=weight_scale_2` not inverted. Gate and up with equal `act` and unequal `weight_scale_2` stay distinct. Missing global scale raises. `model.visual` skipped. Expert names raise `routed experts are not wired` until Task 6.
 
-- Missing `weight_scale_2` raises `global scale`.
-- `compressed-tensors` raises `compressed-tensors is a later checkpoint`.
-- A BF16 shared-expert weight returns `make_b16`.
-- `model.visual` is skipped.
-- An expert name raises `routed experts are not wired`.
-- Gate and up keep distinct `weight_scale_2` values when the fixture gives them different ones.
-
-Point the Task 3 "not wired" assertion at this loader function if `load` now calls it. GPU skip only around the CUDA constructor.
+5D. One real local shape on the lane kernel and one on the prompt kernel. Record dtype, `split_k`, and the envelope. No whole-model load.
 
 ```bash
 git commit -m "feat: map one GLM dense MLP projection to Fp4Linear"
 ```
 
----
+### Task 11A — Allocation inventory, before Task 6
 
-### Task 6: Routed experts load; layer 45 does not
-
-**Objective:** A MoE layer loads `E` experts (the test uses 4) as per-projection `Fp4Linear`s. Shared expert and `mlp.gate` are BF16. Layer-wide `input_scale` is asserted. Serial load does not build `draft_head` and does not read layer 45.
-
-`expert_names` / prefetch currently ask for `.scales` and `.biases`. On this quant prefetch `weight`, `weight_scale`, `weight_scale_2`, and `input_scale` for routed projections, and `.weight` only for the shared expert. Attention uses the BF16 arms. A disagreement in layer-wide scales raises `input scales are not layer-wide`.
-
-`Weights.nbytes` may stay blind to `Fp4Linear`. Do not use it as the residency check. Task 11 adds the geometry term.
+Stream M. Commit the inventory before the loader allocates expert tables. Pointer table, not a second stack. List final weights, load scratch, prepared rows, route metadata, gate/up, routed fp32 slots, shared fp32 output, split-K partials, graphs, collectives, and headroom. Remove the draft-head `9/16` term for this quant. Choose eight-plus-separate-shared or nine fp32 slots, and say whether the old bf16 `ey` remains. File is `src/tensorfold/cuda/geometry.py`.
 
 ```bash
-git commit -m "feat: load GLM routed experts as per-projection Fp4Linears"
+git commit -m "docs: inventory GLM NVFP4 allocations before the loader owns them"
 ```
 
----
+### Task 6 — Load into that storage
 
-### Task 7: NVFP4 startup leaves MTP unloaded
+Stream L. Prefetch `weight`, `weight_scale`, `weight_scale_2`, `input_scale` for routed projections, and `.weight` only for the shared expert. Attention, norms, router, embed, and head use the BF16 arms. No `draft_head`. No layer 45. Eager views and the address table share backing storage; a test checks identity by data pointer, not by summing `nbytes`. E=4 is the numeric fixture. An E=288 test checks addresses without allocating production weights. A failed load frees only what it allocated.
 
-**Objective:** For `quant == "modelopt"`, layer 45 is not requested and no MTP graph is captured. `TF_GLM_MTP=1` raises `unqualified` before NCCL. `0` and `auto` with `--no-drafts` proceed to load. MLX and EXL3 keep today's `mtp_head` behavior, including the default `"1"`.
-
-Test the four settings (`unset`, `0`, `1`, `auto`) against `mtp_head` and against the NVFP4 branch separately, so the existing test that default is `"1"` still passes. Vision stays the `serve_options` error. `engine.py` does not contain `drop --tp 2` or `run on one GPU`.
-
-Qwen and Flash Next `--tp 2` NVFP4 tests still pass.
+`Weights.nbytes` counts an `Fp4Linear` and does not double-count a shared buffer.
 
 ```bash
-git commit -m "feat: GLM NVFP4 refuses the MTP head and keeps two ranks"
+git commit -m "feat: load GLM routed experts into a single-owner table"
 ```
 
----
+### Task 7 — Startup before NCCL
 
-### Task 8: Eager dense and expert oracle
+Stream P, in `nvfp4_policy.py`. Raw environment, so unset is not the same as explicit `1`.
 
-**Objective:** One dense layer and one MoE layer, eager, match a hand-written sequence. No graph yet. Downs are not `matmul_group`.
+| Setting | Result |
+| --- | --- |
+| Unset, `0`, or `auto`, with `--no-drafts` | No layer 45, no draft head, no MTP graph |
+| Explicit `1` | Raise `unqualified` before `set_device` and NCCL |
+| Drafter, drafts on, or any parallel mode | Raise before NCCL |
+| Bad value | Raise |
 
-Dense: gate and up may use `matmul_group` because they share `x` and `act`. Then `glue.swiglu` with limit 10. Then one `checkpoint.matmul` for down under `down.act`, fp32 into the caller's buffer. A row with a gate component above 10 differs from `mlp_prompt`.
+MLX and EXL3 keep `MTP_DEFAULT == "1"`. Vision stays the existing `serve_options` error. Negative tests assert the CUDA and NCCL constructors were not called. When two ranks do run, they exchange a digest of revision, world, rank, context, kernel policy, and cache mode, and a missing peer fails in finite time. `engine.py` does not contain `drop --tp 2` or `run on one GPU`. Qwen and Flash Next still refuse NVFP4 `--tp 2`.
 
-MoE oracle, per selected expert, Python loop: same gate/up quant once, per-expert weights, `glue.swiglu`, per-expert quant of that expert's intermediate, per-expert down, fp32 slots, shared expert BF16, router BF16 in / fp32 scores. The test's experts have different weights, so the intermediates differ. A symmetric fixture is not sufficient.
+```bash
+git commit -m "feat: GLM NVFP4 refuses MTP before NCCL and keeps two ranks"
+```
 
-Output contract tests: a noncontiguous multi-row destination is either honored or copied back, and a canary past the written range stays intact. A wrong dtype raises. One row passing does not cover this.
+### Task 8 — Eager oracles
 
-Attention projections in the fixture are `B16` and never enter `Fp4Linear`.
+Stream N.
+
+Dense: common-input quant for gate and up only when their activation factors match, then `glue.swiglu`, then one down into the caller's fp32 buffer. A gate value above 10 differs from `mlp_prompt`.
+
+Routed: unequal expert weights and unequal `weight_scale_2`. Each down reads its own intermediate. Shared expert stays on the BF16 MLP and still contributes if every routed weight is zero. Highest expert id and the shared slot are separate cases.
+
+Two oracles: lane/decode and prompt/prefill. Do not compare them bitwise. Same-backend bitwise is the gate.
+
+Destination tests: noncontiguous multi-row view, wrong dtype, canary past the write, overlap. A refused buffer raises or is copied back. It is not silently replaced.
 
 ```bash
 git commit -m "feat: run GLM NVFP4 eager projections with per-expert downs"
 ```
 
----
+### Task 9 — TP arithmetic, then real ranks
 
-### Task 9: Two-rank numerical contract
+9A, stream N. Row-split gate/up by concatenation, column-split down by an ordered fp32 sum. Record `split_k` on the full shape and the rank shape. Envelope, not bitwise.
 
-**Objective:** Row-parallel gate/up (concatenate) and column-parallel down (sum fp32 partials in rank order) stay within a declared error of the unsplit projection. Document `split_k` on both shapes. Do not require bitwise equality.
-
-Use the Task 4 shapes and `split_bytes`. Record max abs error. If it is nonzero, the note says whether `split_k` changed. Qwen and Flash Next still refuse `--tp 2`.
+9B and 9C, stream D, only when the GPUs are free or the test uses the `comm=` seam. Small tensors, eager and captured, rank order, repeated calls, both ranks in the capture. A missing peer and a mismatched digest fail and clean up. Both ranks' expert ids are recorded. Do not broadcast one side's ids.
 
 ```bash
-git commit -m "test: GLM NVFP4 two-rank partials stay inside a declared error"
+git commit -m "test: GLM NVFP4 two-rank partials and a two-process smoke test"
 ```
 
----
+### Task 10 — Device dispatch, then graphs
 
-### Task 10: Device-indexed MoE, then graphs
+Stream K, then G. Four commits.
 
-**Objective:** `forward.compute` does not close over a Python list of selected `Fp4Linear`s. Replay with a new route matches the Task 8 oracle bitwise. Prefill packs and scatters.
+10A. One projection. New binding beside `checkpoint.cpp`. Reuse `mma_fp4` and its split-K grouping. 64-bit address offsets. Same-backend bitwise against the eager projection, including a second id on replay. Compute Sanitizer memcheck and initcheck on a tiny fixture. A skipped tool is a limitation, not a pass.
 
-At load, stack each layer's expert weights into a device table `[E, ...]` per projection (gate, up, down), with per-expert `weight_scale_2` beside it. The launch reads expert ids from the tensor `glue.select` already wrote. It calls the existing MMA. It does not call `experts.cu`.
+10B. Full routed decode: one residual quant, eight experts, clamped SwiGLU, eight distinct intermediate quants, downs, shared branch, ordered combine. Asymmetric experts. Saturating activations. Shared-only contribution.
 
-1. Quantize the residual once under the layer gate scale.
-2. Gate and up for the selected ids, each expert its own weights and its own `weight_scale_2`.
-3. `glue.swiglu` with limit 10 on each expert's pair.
-4. Quantize the `R * 8` intermediate rows under the down scale. Down for expert `e` reads only its rows.
-5. Combine, then `gather`.
+10C. Prefill: counts, exclusive prefix sums, stable pack, tile descriptors sized for the worst case, scatter to `[token, slot]`, then the deterministic combine. Do not atomic-add fp32 outputs in completion order. Tests: all tokens on the same eight experts, balanced, empty, last id, counts around the tile, every row a different route, large then small reuse. Padding writes nothing a user can see. Unselected experts do no logical work.
 
-Prefill uses the pack → GEMM → scatter order from the dataflow section. Tests: every row a different route, one expert empty, one expert taking most of the chunk, and a second call with a different route. The implementation must not run a row through an expert it did not pick.
-
-Graphs: capture rows 1 and 4. Replay. Change the ids on the device and replay again without recapturing. The second output matches the oracle for the new ids. If the only way to do that is a new multiply, stop and leave the eager oracle in place; do not qualify the graph.
+10D. Primitive graph: supplied ids change, table addresses do not. Full-forward graph: change the input so the real router changes the route, and check it is not overwritten back. Every row count the serve can replay, both parities, and the sparse bucket transition if that path is reachable. If serial NVFP4 supports fewer rows, refuse the others at startup. Sequences: A then B then A, large then small then large, graph then eager then graph. Capture leaves a clean recurrent state. Say in the manifest whether prefill is eager. Do not call eager prefill graph-qualified.
 
 ```bash
 git commit -m "feat: index GLM NVFP4 experts from a device table"
 ```
 
----
+### Task 11B — Measure the inventory
 
-### Task 11: Count the bytes the new path allocates
-
-**Objective:** `mla_geometry` grows by the NVFP4 slot scratch for the decode window and for a prefill chunk, and the startup log can separate weight bytes, graph pool, cache, prefill scratch, and headroom.
-
-Include the 256 MiB figure for a 2048-row fp32 down-slot buffer as a comment next to the term, so a later change that materializes `[R, 8, hidden]` shows up in admission. Do not build `draft_head`. Run `tests/test_cuda_geometry.py` and `tests/test_cuda_capacity.py`.
+Stream M, after each GPU milestone and again before a full load. Compare the dry-run geometry to unique allocations, not to the sum of views. Log peak load, post-load, post-capture, and the largest prefill. A model that fits after load and cannot survive the admitted prefill fails this gate. Do not infer the unified-memory budget from one API.
 
 ```bash
-git commit -m "feat: account for GLM NVFP4 expert scratch in admission"
+git commit -m "feat: reconcile GLM NVFP4 admission with measured peaks"
 ```
 
----
+### Task 12 — Record, then compare
 
-### Task 12: Record the reference, then compare
+Only with approval, and only after `PRIMITIVE_PASS`, `ROUTED_PASS`, `GRAPH_PASS`, `TP_PASS`, and a dry-run admission for the exact context. The orchestrator does not start this because the calendar is clear.
 
-**Objective:** A harness with two modes. Record does not require TensorFold weights resident. Compare does not require vLLM resident. Neither mode stops the existing server unless a separate approval says so, and that approval includes how the server is restored.
+12A. Reference capture of this checkpoint revision. Repeatability of the reference itself first. Golden package from Evidence. Timing from an uninstrumented process, traces from a labeled instrumented one.
 
-**Record** (`tools/glm_nvfp4_record.py`), when a reference is available without taking the machine:
+12B. Hashes and schema checks before that process exits.
 
-- Manifest fields: container digest or version strings, GPU capability, CUDA, NCCL, FlashInfer or CUTLASS if the log prints them, the MoE backend line for prefill and for decode, whether activations stayed FP4 or fell back, whether the SwiGLU clamp is on, cache dtype and layout.
-- Prompt token ids, tokenizer revision, special-token policy, temperature 0.
-- Returned token ids from the API field, not from retokenizing text. If the server can return logprobs, store those and label them as logprobs, not as logits.
-- One teacher-forced continuation: the same id sequence fed as context, next-token distribution at each position.
+12C. Candidate loads the manifest directory, not `nvidia/GLM-5.3-Flash-NVFP4` as a floating name. Smoke the France prompt as `TOKEN_IDS_ONLY`. Then the fixed teacher-forced corpus, prefill and incremental, with position semantics written on each record (`prefix length t predicts token t` or otherwise).
 
-If no reference can be observed without exclusive access, the note says that and stops. Do not pull 190 GiB beside a live copy.
+12D. Earliest recorded boundary. Router ids on both ranks. If a probe is missing, report the interval.
 
-**Compare** (`tools/glm_nvfp4_compare.py`): TensorFold against the saved record. Smoke: the France prompt's token ids. Qualification: teacher-forced agreement on the saved continuation, plus max absolute error and top-2 margin where numbers were stored. A string match alone is not `MATCH`.
+12E. Write the status JSON. Restore the previous serve whether or not the candidate passed.
 
-On the first miss, trace the first layer whose residual differs, and record router ids on both ranks (they must match each other) before looking at the KV writer. Layers 0–2 and the first MoE up/SwiGLU/down are the probes.
-
-TensorFold serve, only inside an approved window, both ranks:
+`DENSE_FIDELITY_PASS` needs the numeric gates, input identity, the observation coverage the manifest required, and the path tests. Token parity is its own field.
 
 ```bash
-TF_GLM_MTP=0 tensorfold serve nvidia/GLM-5.3-Flash-NVFP4 --tp 2 --rank 1 --master RANK0 --no-drafts
-TF_GLM_MTP=0 tensorfold serve nvidia/GLM-5.3-Flash-NVFP4 --tp 2 --rank 0 --master RANK0 --no-drafts --host 127.0.0.1 --port 8080
+git commit -m "test: compare GLM NVIDIA NVFP4 to a saved reference"
 ```
 
-`TF_GLM_MTP=0` is belt and suspenders. Task 7 already refuses to load the head for this quant. The commands omit `--context`, so this is the dense-window qualification. Do not call it 32k.
-
-vLLM, when it is recorded, is `--tensor-parallel-size 2`, greedy, no speculative decoding. Do not copy the card's TP 4.
-
-The note records `MATCH` or `DIVERGE` and the index. A `DIVERGE` note is still committed. Recipe text stays unqualified.
+Commands, inside that window:
 
 ```bash
-git commit -m "test: record and compare GLM NVIDIA NVFP4 against a saved vLLM reference"
+TF_GLM_MTP=0 tensorfold serve <manifest-snapshot> --tp 2 --rank 1 --master RANK0 --no-drafts
+TF_GLM_MTP=0 tensorfold serve <manifest-snapshot> --tp 2 --rank 0 --master RANK0 --no-drafts --host 127.0.0.1 --port 8080
 ```
 
----
+No `--context` here. This is the dense window. vLLM, when recorded, is `--tensor-parallel-size 2`, greedy, no speculative decoding. Not the card's TP 4.
 
-### Task 13: Long context is a separate qualification
+### Task 13 — Long context
 
-**Objective:** Do not attach a 32k speed to the Task 12 serve.
-
-A long-context run sets `--context` on both ranks to at least the prompt plus the generated tokens, and it is attempted only after Task 12 is `MATCH` on the dense window. Before any 32k timing, one eager check crosses `dense_limit` and checks the chunk boundary. If that check is absent, the recipe does not mention 32k.
-
-KDA state and the latent are part of the cold-versus-prefix check in the KV section. This task does not add FP8 latent unless Task 12's manifest says the reference was fp8 and the writer is known.
+After `DENSE_FIDELITY_PASS`. Both ranks get `--context` at least prompt plus generated tokens, and the log must show that effective context. Before any 32k timing: one step around `dense_limit`, the prefill chunk boundary, and a sparse pool boundary. Cold, reset, and a continuation after an unrelated request. KDA conv and recurrent state, not only the latent. Prefix reuse only if the engine already has it. FP8 latent only after the reference writer is identified. A mixed-cache run can localize a bug and cannot pass same-cache parity.
 
 ```bash
 git commit -m "test: qualify GLM NVFP4 past the dense attention window"
 ```
 
----
+### Task 14 — Timings, one change at a time
 
-### Task 14: Profile, then write numbers
+After the fidelity status that the sentence will claim. Unqualified diagnostic timings from earlier windows stay out of the recipe.
 
-**Objective:** One request, two ranks, the device-indexed path, only if Task 12 is `MATCH`. If the serve is still the eager oracle, say so and do not compare it to the 8.9 GB bound.
+Report streaming time to first token, generated-token count, decode-only tok/s, median and tail inter-token time, warmup excluded, cold and warm prefix separately if both exist, context, chunk, peak memory, and power if the machine reports it. Load and capture are not part of steady state. Do not add overlapping profile ranges and call the sum the token.
 
-Repeated identical greedy trials, not five seeds of a deterministic decode. Report generated-token count, time to first token from the stream (not the full non-streaming duration), decode-only tok/s, median and tail inter-token time, warmup excluded, cold prefix and warm prefix separately, context, peak memory, and power if the machine reports it. Separate load and graph capture from the steady state.
+Profile routed experts, shared experts, KDA Q/K/V/O, other attention, the head, collectives, and leftover. Label numerators as in the traffic section.
 
-Also report, for one decoded token: expert-kernel time, KDA time, head time, and collective time. Put the partial table next to the tok/s. MoE-only efficiency uses 2.38 GB, not 8.86. Full-token efficiency uses 8.86 and still says the 11 sparse layers are missing.
+An optimization record: hypothesis, exact change, invariant, expected effect, tests required, memory effect, measurement, outcome, rollback. One mechanism per record. A fusion or a `split_k` change is a new numeric policy and reopens the oracle.
 
-Update `docs/recipes/glm-5.3-flash.md` and the GLM row of `docs/recipes/cuda.md` only to the checkpoint id, "two ranks, teacher-forced match against a recorded vLLM reference, dense window", and the measured table. Do not copy the Qwen ratio. Do not say vision, MTP, concurrency, expert parallel, or long context are qualified unless that task recorded it.
+The recipe may say dense-window single-request parity, or long-context parity, only when that status is set. It does not say MTP, vision, expert parallel, concurrency, or that this replaces the existing server.
 
 ```bash
-git commit -m "docs: record GLM NVIDIA NVFP4 match and one-request speed"
+git commit -m "docs: record GLM NVIDIA NVFP4 qualification and scoped speed"
 ```
 
 ---
 
+## Non-goals
+
+- No new MMA. The dispatch wrapper is in scope.
+- No CUTLASS, FlashInfer, or TensorRT-LLM dependency.
+- No `experts.cu` on this checkpoint.
+- No EXL3 work, no RedHat loader, no Apple NVFP4.
+- No vision, no DFlash2, no layer-45 load. `incoai/GLM-5.3-Flash-DFlash2` is CC BY-NC-ND 4.0.
+- No expert parallelism, no `--parallel`, no second resident copy.
+- No "Four Over Six" rescale.
+- No published speed before the matching fidelity status.
+
+## Stop conditions
+
+- The pinned census moves, or layer-wide activation scales disagree across shards.
+- A split cuts a group of 16, leaves logical K not a multiple of 64, or splits a scalar.
+- Expert storage is allocated twice.
+- The device path does not match its same-backend eager oracle bitwise, including a second route and a skewed chunk.
+- The only graph strategy left is recapture-per-token or copying selected weights.
+- A full-vocabulary or layer-trace claim is made from top-k logprobs.
+- A tolerance is widened so the candidate passes.
+- Continuing requires stopping the live serve before the comparator and the restore plan exist.
+- The work needs a multiply other than `lane4.cu` / `gemm_ck.cu` / `gemm_ws.cu`.
+
 ## After this plan
 
-RedHat compressed-tensors, after Task 12 is `MATCH`. Reuse the Qwen reciprocal global scale. Do not reopen EXL3.
+RedHat compressed-tensors, after `DENSE_FIDELITY_PASS`, reusing the Qwen reciprocal global scale. MTP on the BF16 layer-45 experts. A multi-request serve. A clamped SwiGLU fusion only after it matches `glue.swiglu` bitwise on the same rows.
 
-MTP on the BF16 layer-45 experts. The tensors exist. This plan refuses them.
+## Checklist
 
-A multi-request serve. One stream is not a replacement for the existing vLLM server.
-
-A clamped fusion of SwiGLU into the down quantizer, only with a bitwise match to `glue.swiglu`.
-
----
-
-## Verification checklist
-
-- [ ] Manifest names the tree and the checkpoint revision. No silent rebase.
-- [ ] Census note matches the table, including no `weight_packed` and unscaled layer 45.
-- [ ] `pytest` on `test_glm5_nvfp4_config.py`, `test_glm5_nvfp4_loader.py`, and `test_glm5_nvfp4_split.py` passes. GPU skips are not qualification.
+- [ ] Manifest names tree, dirty state, and checkpoint revision. Launches use that directory.
+- [ ] Comparator tests pass on CPU, including the false near-tie and the top-k refusal.
+- [ ] Census matches the table, or the plan was updated before loader work.
+- [ ] `test_glm5_nvfp4_config.py`, `test_glm5_nvfp4_split.py`, and `test_glm5_nvfp4_loader.py` pass. GPU skips are not qualification.
 - [ ] Qwen and Flash Next still refuse NVFP4 `--tp 2`. MLX/EXL3 `MTP_DEFAULT` is still `"1"`.
-- [ ] NVFP4 with `TF_GLM_MTP` unset does not read layer 45.
-- [ ] Expert downs are not `matmul_group`. A test with unequal expert weights fails if they were.
-- [ ] A graph replay follows a changed device-side route.
-- [ ] Prefill does not evaluate unselected experts.
-- [ ] No `incoai` drafter and no second model copy. The existing serve was not stopped without an approved restore.
-- [ ] Task 12 says `MATCH` or `DIVERGE` on teacher-forced ids, not on a retokenized string. Speed docs exist only after `MATCH`, and they quote the partial traffic table.
-
----
+- [ ] Unset `TF_GLM_MTP` on this quant does not read layer 45 and does not call NCCL first.
+- [ ] Pointer-table test shows one data pointer for eager and device paths.
+- [ ] Expert downs are not `matmul_group`. Unequal weights fail the test if they were.
+- [ ] Prepared-row round-trip fails if scale axis 0 is treated as the row axis.
+- [ ] Primitive graph and full-forward graph both follow a changed route.
+- [ ] Prefill worst-case capacity is in admission. Empty experts do no logical work.
+- [ ] Sanitizer result for the dispatch is pass or an explicit limitation.
+- [ ] No `incoai` pull, no second model copy, live serve restored after any approved window.
+- [ ] Recipe text matches a status record. `DENSE_FIDELITY_PASS` is not `LONG_CONTEXT_FIDELITY_PASS`.
 
 ## References
 
 Format and export:
 
-- NVIDIA, "Introducing NVFP4 for Efficient and Accurate Low-Precision Inference": https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/
-- Model card `nvidia/GLM-5.3-Flash-NVFP4` (recipe name, TP4 example, the shared-expert sentence this plan does not follow; test hardware listed as GB200): https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4
-- ModelOpt `NVFP4QTensor.get_activation_scaling_factor` (`amax / (6 * 448)`) and block scales: https://github.com/NVIDIA/Model-Optimizer/blob/main/modelopt/torch/quantization/qtensor/nvfp4_tensor.py
+- NVIDIA NVFP4 introduction: https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/
+- Model card (recipe name, TP4 example, GB200 test note; the shared-expert sentence is not followed): https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4
+- ModelOpt `NVFP4QTensor` (global factor `amax / (6 * 448)`, block-scale clamp on current `main`): https://github.com/NVIDIA/Model-Optimizer/blob/main/modelopt/torch/quantization/qtensor/nvfp4_tensor.py
 - ModelOpt PTQ recipes: https://github.com/NVIDIA/Model-Optimizer/blob/main/modelopt_recipes/ptq.md
-- OCP Microscaling Formats v1.0 (MXFP4, E8M0, group 32). This export is not that format: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
-- TensorRT-LLM quantization table (NVFP4 compute and FP8 KV are separate rows): https://nvidia.github.io/TensorRT-LLM/latest/features/quantization.html
+- OCP MX v1.0 (E8M0, group 32). This export is not that format: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+- TensorRT-LLM quantization table: https://nvidia.github.io/TensorRT-LLM/latest/features/quantization.html
 
 Engines:
 
-- vLLM `select_nvfp4_moe_backend` at 0.22.1 (clamp list versus error text): https://docs.vllm.ai/en/v0.22.1/api/vllm/model_executor/layers/fused_moe/oracle/nvfp4/
-- vLLM oracle on `main` (wider list, shape-specific fallbacks): https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
-- vLLM ModelOpt loader (NVFP4 with and without quantized activations): https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
-- vLLM completion protocol (token ids and logprobs are different fields): https://docs.vllm.ai/en/latest/api/vllm/entrypoints/openai/completion/protocol/
-- vLLM batch invariance is documented as beta and is not assumed here: https://docs.vllm.ai/en/latest/features/batch_invariance/
-- FlashInfer issue 2723 (historical SM120 grouped GEMM failure; do not vendor): https://github.com/flashinfer-ai/flashinfer/issues/2723
-- SGLang issue 21802 (fused gate/up dropped a distinct weight scale; different model): https://github.com/sgl-project/sglang/issues/21802
-- vLLM issue 53963 (stock SM120 sparse MLA rejects `qk_rope_head_dim` 0): https://github.com/vllm-project/vllm/issues/53963
-- vLLM recipe file lists the RedHat NVFP4 checkpoint, not this export: https://github.com/vllm-project/recipes/blob/main/models/zai-org/GLM-5.3-Flash.yaml
+- vLLM NVFP4 oracle 0.22.1: https://docs.vllm.ai/en/v0.22.1/api/vllm/model_executor/layers/fused_moe/oracle/nvfp4/
+- vLLM oracle on `main` (snapshot context `4e4d75c4594b1072729ffe335c9bcea601749f71` was inspected in the third review; it is not this tree's pin): https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
+- vLLM ModelOpt loader: https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
+- vLLM completion protocol: https://docs.vllm.ai/en/latest/api/vllm/entrypoints/openai/completion/protocol/
+- vLLM batch invariance (beta, not assumed): https://docs.vllm.ai/en/latest/features/batch_invariance/
+- FlashInfer issue 2723: https://github.com/flashinfer-ai/flashinfer/issues/2723
+- SGLang issue 21802 (distinct gate/up weight scales dropped by a fusion; other model): https://github.com/sgl-project/sglang/issues/21802
+- vLLM issue 53963 (SM120 sparse MLA rejects rope head dim 0): https://github.com/vllm-project/vllm/issues/53963
+- NCCL graph collective participation: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/cudagraph.html
+- PyTorch CUDA graph memory pools: https://docs.pytorch.org/docs/stable/notes/cuda.html
+- Compute Sanitizer: https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html
 
-Hardware and research:
+Research, with their limits:
 
-- DGX Spark hardware guide (128 GB unified, 273 GB/s): https://docs.nvidia.com/dgx/dgx-spark/hardware.html
-- arXiv:2609.15030, hybrid-state cache restore on GLM-5.3-Flash. RedHat NVFP4, TP 4, not this port.
-- arXiv:2603.08747, "Diagnosing FP4 inference". Qwen2.5 probe placement, not a GLM measurement.
-- arXiv:2512.02010, "Four Over Six". A different quantization recipe. Not used here.
+- arXiv:2609.15030, GLM-5.3-Flash hybrid-state restore. RedHat NVFP4, TP 4, not this port.
+- arXiv:2603.08747, FP4 diagnosis on Qwen2.5. Probe placement only.
+- arXiv:2512.02010, Four Over Six. A different recipe. Not used.
 
-In-tree:
+In-tree, at `56e2e3ec55bc0ae1d7d5158c4fa2c79a3567ab21`:
 
-- `src/tensorfold/cuda/nvfp4/checkpoint.py` — `matmul_group` is one input; `_out` and the missing copy-back
-- `src/tensorfold/cuda/kernels/qmm.py` — `split_k`
-- `src/tensorfold/families/glm5_next/cuda/engine.py` — `MTP_DEFAULT`, `mtp_head`, default dense window
-- `src/tensorfold/families/glm5_next/cuda/graphs.py` — capture of `compute`
-- `src/tensorfold/families/glm5_next/cuda/glue.py` — `swiglu`, `router`, `select`
-- `src/tensorfold/families/glm5_next/cuda/split.py` — `split_bytes` and `split_device`
-- `src/tensorfold/cuda/geometry.py` — latent bytes per rank, EXL3 scratch hook
-- `src/tensorfold/families/glm5_next/cuda/weights.py` — `draft_head` on the EXL3 arm, prefetch names
+- `src/tensorfold/cuda/nvfp4/checkpoint.cpp` `lane` — one weight, one alpha, scales `(K/64, mpad, 4)`
+- `src/tensorfold/cuda/nvfp4/nvfp4q.cuh` `block_scale`
+- `src/tensorfold/cuda/nvfp4/checkpoint.py` — `matmul_group`, `_out`
+- `src/tensorfold/cuda/kernels/qmm.py` `split_k`
+- `src/tensorfold/families/glm5_next/cuda/engine.py` — `MTP_DEFAULT`, dense window
+- `src/tensorfold/families/glm5_next/cuda/forward.py` — `slots = top_k + 1`, prefill `ey` bf16
+- `src/tensorfold/families/glm5_next/cuda/glue.py` — `swiglu`, `select`
+- `src/tensorfold/families/glm5_next/cuda/graphs.py`
+- `src/tensorfold/families/glm5_next/cuda/split.py`
+- `src/tensorfold/cuda/geometry.py` — latent per rank, draft-head `9/16`
