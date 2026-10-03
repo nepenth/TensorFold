@@ -1,8 +1,7 @@
 """One GLM MoE layer in a single-owner pointer table.
 
-``weights.load`` still refuses a modelopt tree. This packs tensors the caller
-already holds. It does not read a shard, and it does not call the grouped
-expert kernel. Expert downs stay distinct owners.
+This packs checkpoint tensors the caller already holds, without reading shards
+or calling a grouped expert kernel. Expert downs stay distinct owners.
 """
 
 from __future__ import annotations
@@ -207,6 +206,22 @@ def load_synthetic_layer(
 ) -> RoutedTable:
     """Pack one synthetic layer. Scale disagreement raises before any expert is packed."""
 
+    return _load_layer(layer=layer, experts=experts, shared=shared, shards=shards, synthetic=True)
+
+
+def load_checkpoint_layer(
+    *,
+    layer: int,
+    experts: Mapping[int, Mapping[str, Mapping[str, torch.Tensor]]],
+    shared: Mapping[str, torch.Tensor],
+) -> RoutedTable:
+    """Pack rank-local checkpoint tensors into the same owners used by eager execution."""
+
+    return _load_layer(layer=layer, experts=experts, shared=shared, shards=None, synthetic=False)
+
+
+def _load_layer(*, layer: int, experts: Mapping, shared: Mapping, shards: list | None,
+                synthetic: bool) -> RoutedTable:
     if layer == 45:
         raise ValueError("layer 45 is not loaded")
     if layer < 0:
@@ -218,7 +233,8 @@ def load_synthetic_layer(
         _same_shard(blocks, _ordered(extra))
     shared_weights = _check_shared(shared)
     scales = {proj: _scales(blocks, proj) for proj in PROJECTIONS}
-    _refuse_production(blocks)
+    if synthetic:
+        _refuse_production(blocks)
     built: list[Fp4Linear] = []
     try:
         for index, block in enumerate(blocks):

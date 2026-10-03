@@ -1,11 +1,11 @@
-"""Load one rank of MLX affine 4-bit weights or EXL3 routed experts with BF16 elsewhere, preserving heads and quantization groups at split boundaries."""
+"""Load one rank of MLX, EXL3, or ModelOpt NVFP4 weights, preserving split boundaries."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -14,6 +14,9 @@ from tensorfold.cuda import experts as grouped
 from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
 from . import latent
 from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
+
+if TYPE_CHECKING:
+    from .nvfp4_table import RoutedTable
 
 PREFIX = "model.language_model."
 
@@ -64,7 +67,7 @@ class Config:
     mtp_layers: int
     group_size: int
     bits: int
-    quant: str = "mlx"         # "mlx" (affine 4-bit everywhere) or "exl3" (EXL3 routed experts, BF16 elsewhere)
+    quant: str = "mlx"         # MLX affine 4-bit, or EXL3/ModelOpt routed experts with BF16 elsewhere
 
     @classmethod
     def read(cls, model_dir: str | Path) -> "Config":
@@ -182,7 +185,7 @@ class MLPW:
 class MoEW:
     router: torch.Tensor      # [E, D] bf16
     bias: torch.Tensor        # [E] fp32
-    experts: grouped.Experts | Exl3Experts  # 4-bit: E + 1 (shared expert last); EXL3: the E routed experts
+    experts: grouped.Experts | Exl3Experts | RoutedTable
     shared: MLPW | None = None            # EXL3 checkpoints: the shared expert (BF16)
 
 
@@ -198,6 +201,7 @@ class LayerW:
     dsa: DSAW | None = None
     mlp: MLPW | None = None
     moe: MoEW | None = None
+    dense_nvfp4: object | None = None
 
 
 @dataclass
@@ -212,7 +216,7 @@ class MTPW:
 @dataclass
 class Weights:
     cfg: Config
-    embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | torch.Tensor
     layers: list[LayerW]
     norm: torch.Tensor
     head: Q4 | B16
@@ -234,15 +238,22 @@ class Weights:
 
         total = 0
         seen = set()
+        objects = set()
         owned = (Q4, B16, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW,
                  Fp4Linear, Staging, RoutedTable)
 
         def add(t):
             nonlocal total
-            if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
-                seen.add(t.data_ptr())
-                total += t.numel() * t.element_size()
+            if isinstance(t, torch.Tensor):
+                storage = t.untyped_storage()
+                key = (t.device, storage.data_ptr())
+                if key not in seen:
+                    seen.add(key)
+                    total += storage.nbytes()
             elif isinstance(t, owned):
+                if id(t) in objects:
+                    return
+                objects.add(id(t))
                 for v in vars(t).values():
                     add(v)
             elif isinstance(t, (list, tuple)):
@@ -268,13 +279,21 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
 
     world = 2
     cfg = Config.read(model_dir)
-    if cfg.quant == "modelopt":
-        raise ValueError("GLM-5.3-Flash NVFP4 tensors are not wired")
-    if cfg.quant not in ("mlx", "exl3"):
+    nvfp4 = cfg.quant == "modelopt"
+    if nvfp4:
+        from .nvfp4_policy import admit_recipe
+        from . import nvfp4_table
+
+        raw = json.loads((Path(model_dir) / "config.json").read_text())
+        admit_recipe(raw.get("quantization") or raw.get("quantization_config") or {})
+        if mtp:
+            raise ValueError("GLM NVFP4 MTP is unqualified; load with mtp=False")
+    if cfg.quant not in ("mlx", "exl3", "modelopt"):
         raise ValueError(
             f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit, EXL3, or NVIDIA NVFP4, not {cfg.quant}"
         )
     exl3 = cfg.quant == "exl3"
+    bf16 = exl3 or nvfp4
     dev = torch.device(device)
     rd = RankReader(model_dir, rank)
     HL = cfg.heads // world
@@ -290,10 +309,10 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
 
     def q4(name: str) -> Q4 | B16:
-        return make_b16(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+        return make_b16(t(name + ".weight")) if bf16 else make_q4(*trip(name))
 
     def stack(names: list[str]) -> Q4 | B16:
-        if exl3:
+        if bf16:
             return stack_b16([t(n + ".weight") for n in names])
         return stack_q4([trip(n) for n in names])
 
@@ -313,7 +332,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         proj = stack([p + "q_a_proj", p + "kv_a_proj_with_mqa"])
         rows = torch.arange(HL * 512, device=dev).view(HL, 512)
         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
-        if exl3:
+        if bf16:
             w = t(p + "kv_b_proj.weight")
             kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
             full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
@@ -323,7 +342,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             kv_v = make_q4(w[vrows], s[vrows], b[vrows])
         if not latent.ENABLED:
             absorb = None
-        elif exl3:
+        elif bf16:
             absorb = latent.AbsorbW.from_rows(full_k(), full_v(), HL)
         elif cfg.group_size == 64:        # the checkpoint's own 4-bit rows, read as they are stored
             absorb = latent.AbsorbQ4((w[krows], s[krows], b[krows]), (w[vrows], s[vrows], b[vrows]), HL)
@@ -347,6 +366,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         mtp_layer = i == cfg.layers and cfg.mtp_layers and mtp
         if not mtp_layer and (i >= cfg.layers or cfg.mlp_kinds[i] != "moe"):
             return []
+        if nvfp4:
+            return nvfp4_table.prefetch_names(i, cfg.experts)
         p, parts = PREFIX + f"layers.{i}.mlp.", ("trellis", "suh", "svh") if exl3 else ("weight", "scales", "biases")
         names = []
         for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -384,6 +405,16 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         p = f"layers.{i}.mlp."
         router = t(p + "gate.weight", torch.bfloat16).contiguous()
         bias = t(p + "gate.e_score_correction_bias", torch.float32).contiguous()
+        if nvfp4:
+            blocks = {
+                e: {proj: {key: t(p + f"experts.{e}.{proj}.{key}")
+                           for key in nvfp4_table.ROUTED_KEYS}
+                    for proj in nvfp4_table.PROJECTIONS}
+                for e in range(cfg.experts)
+            }
+            shared = {proj: t(p + f"shared_experts.{proj}.weight") for proj in nvfp4_table.PROJECTIONS}
+            table = nvfp4_table.load_checkpoint_layer(layer=i, experts=blocks, shared=shared)
+            return MoEW(router, bias, table)
         if exl3:
             return MoEW(router, bias, moe_exl3(p), mlp(p + "shared_experts."))
         parts = {}
@@ -402,6 +433,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         del parts
         return MoEW(router, bias, ex)
 
+    def dense_nvfp4_table(i: int):
+        from tensorfold.cuda.nvfp4.linear import Fp4Linear
+
+        p = f"layers.{i}.mlp."
+        built = []
+        scales = {}
+        for proj in nvfp4_table.PROJECTIONS:
+            prefix = p + proj + "."
+            weight = t(prefix + "weight")
+            wscale = t(prefix + "weight_scale")
+            scale = float(t(prefix + "weight_scale_2").reshape(-1)[0])
+            act = float(t(prefix + "input_scale").reshape(-1)[0])
+            built.append(Fp4Linear.from_checkpoint(weight, wscale, scale, act=act))
+            scales[proj] = (scale, act)
+        return nvfp4_table._assemble(i, built, scales, {})
+
     layer_events: list = []                              # each layer's event, recorded once its work is queued
 
     def layer(i: int, plain: bool = False) -> LayerW:
@@ -419,28 +466,45 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         else:
             lw.dsa = dsa(i)
         if mk == "dense":
-            lw.mlp = mlp(f"layers.{i}.mlp.")
+            scale = PREFIX + f"layers.{i}.mlp.gate_proj.weight_scale"
+            if nvfp4 and scale in rd.index:
+                lw.dense_nvfp4 = dense_nvfp4_table(i)
+            else:
+                lw.mlp = mlp(f"layers.{i}.mlp.")
         else:
             lw.moe = moe(i)
-        if i % 8 == 7:                            # each release waits for the device; a layer leaves few temporaries
+        if not nvfp4 and i % 8 == 7:               # the existing quant arms release cached temporaries
             torch.cuda.empty_cache()
         layer_events.append(torch.cuda.current_stream().record_event())
         return lw
 
-    if exl3:
-        embed = rd.get(PREFIX + "embed_tokens.weight").to(torch.bfloat16).contiguous().to(dev)
-    else:
-        embed = (as_i32(rd.get(PREFIX + "embed_tokens.weight")).to(dev), rd.get(PREFIX + "embed_tokens.scales").to(dev),
-                 rd.get(PREFIX + "embed_tokens.biases").to(dev))
+    built = []
+    embed = head = w = None
     try:                                          # a failed load still cancels the reads queued ahead
+        if nvfp4:
+            # Layer 45 is in the pinned index and must not be loaded. Visual
+            # tensors are not this engine. A draft head is still a refusal.
+            for name in rd.index:
+                if nvfp4_table._layer_index(name) == 45:
+                    continue
+                if name.startswith("model.visual") or name.startswith("visual."):
+                    continue
+                nvfp4_table.storage_arm(name)
+        if bf16:
+            embed = rd.get(PREFIX + "embed_tokens.weight").to(torch.bfloat16).contiguous().to(dev)
+        else:
+            embed = (as_i32(rd.get(PREFIX + "embed_tokens.weight")).to(dev), rd.get(PREFIX + "embed_tokens.scales").to(dev),
+                     rd.get(PREFIX + "embed_tokens.biases").to(dev))
         which = list(range(cfg.layers))
-        built = [layer(i) for i in which]
+        for i in which:
+            built.append(layer(i))
         vl = cfg.vocab // world
         draft_head = None
-        if exl3:
+        if bf16:
             head = make_b16(rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev))
             # Draft steps use the quantized head; verification keeps the original head.
-            draft_head = quantize4(head.weight)
+            if exl3:
+                draft_head = quantize4(head.weight)
         else:
             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
             head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),
@@ -452,7 +516,17 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
                         t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
         w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head)
         w.meta.update(layers=which)
+    except Exception as exc:
+        if nvfp4:
+            import traceback
+
+            # Drop this load's owners, including those retained by finished packing frames.
+            traceback.clear_frames(exc.__traceback__)
+            built.clear()
+            embed = head = w = None
+        raise
     finally:
         rd.close()
-    torch.cuda.empty_cache()
+    if not nvfp4:
+        torch.cuda.empty_cache()
     return w

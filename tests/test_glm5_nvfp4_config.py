@@ -92,15 +92,67 @@ def test_family_check_names_a_bad_group(tmp_path: Path):
         glm5_next.check(tmp_path)
 
 
-def test_glm_cuda_loader_still_refuses_modelopt(tmp_path: Path):
-    """The refusal is the quant gate, not a missing field earlier in Config.read."""
+def test_glm_cuda_loader_accepts_modelopt_bf16_arms(tmp_path: Path, monkeypatch):
+    """An empty-layer checkpoint reaches the BF16 embed, norm, and head arms on CPU."""
 
-    pytest.importorskip("torch")
-    (tmp_path / "config.json").write_text(json.dumps(_config()))
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("triton")
+    from tensorfold.families.glm5_next.cuda.qmm import B16
+    from tensorfold.families.glm5_next.cuda.split import write
     from tensorfold.families.glm5_next.cuda.weights import load
 
-    with pytest.raises(ValueError, match="NVFP4 tensors are not wired"):
-        load(tmp_path, rank=0)
+    config = _config()
+    config["text_config"].update(num_hidden_layers=0, layer_types=[], hidden_size=64)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    tensors = {
+        "model.language_model.embed_tokens.weight": torch.arange(128 * 64).reshape(128, 64).to(torch.bfloat16),
+        "model.language_model.norm.weight": torch.ones(64, dtype=torch.bfloat16),
+        "lm_head.weight": torch.arange(128 * 64).reshape(128, 64).to(torch.bfloat16),
+    }
+    write(str(tmp_path / "model.safetensors"), [
+        (name, "BF16", list(t.shape), t.view(torch.uint8).numpy().reshape(-1))
+        for name, t in tensors.items()
+    ], None)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("NVFP4 loader MUST NOT allocate a draft head or flush unrelated CUDA caches")
+
+    monkeypatch.setattr("tensorfold.families.glm5_next.cuda.weights.quantize4", forbidden)
+    monkeypatch.setattr(torch.cuda, "empty_cache", forbidden)
+    loaded = load(tmp_path, rank=1, device="cpu", mtp=False)
+    assert loaded.cfg.quant == "modelopt" and loaded.layers == []
+    assert isinstance(loaded.head, B16)
+    assert torch.equal(loaded.embed, tensors["model.language_model.embed_tokens.weight"])
+    assert torch.equal(loaded.norm, tensors["model.language_model.norm.weight"])
+    assert torch.equal(loaded.head.weight, tensors["lm_head.weight"][64:])
+    assert loaded.mtp is None and loaded.draft_head is None
+
+
+def test_modelopt_loader_refuses_mtp_before_opening_reader(tmp_path: Path, monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("triton")
+    from tensorfold.families.glm5_next.cuda.weights import load
+
+    (tmp_path / "config.json").write_text(json.dumps(_config()))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("MTP MUST raise before opening a reader")
+
+    monkeypatch.setattr("tensorfold.families.glm5_next.cuda.split.RankReader", forbidden)
+    with pytest.raises(ValueError, match="MTP.*unqualified"):
+        load(tmp_path, rank=0, mtp=True)
+
+
+def test_cuda_loader_keeps_compressed_tensors_refusal(tmp_path: Path):
+    pytest.importorskip("torch")
+    pytest.importorskip("triton")
+    from tensorfold.families.glm5_next.cuda.weights import load
+
+    config = _config()
+    config["quantization_config"]["quant_method"] = "compressed-tensors"
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="not compressed-tensors"):
+        load(tmp_path, rank=0, mtp=False)
 
 
 @pytest.mark.parametrize("raw", [None, "", "0", "auto", " AUTO "])
