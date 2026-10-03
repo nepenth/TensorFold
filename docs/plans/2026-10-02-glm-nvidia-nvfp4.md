@@ -24,7 +24,7 @@ Decode and prefill share weights and the numeric meaning of a projection. They d
 
 Tracking note: `docs/plans/notes/nvidia-glm-nvfp4-status.md`. Branch `plan/glm-nvidia-nvfp4`. Checkpoint revision `da920bb0b9f4a06727223a349e55468e38352348`. Reference status `BLOCKED_REFERENCE`.
 
-CPU work through the allocation inventory is on the branch. A synthetic engine step returns finite logits at hidden size 128. The pinned snapshot is local, hidden size 4096, 288 routed experts, and has not been opened. Modelopt does not capture a CUDA graph.
+CPU work through the allocation inventory is on the branch. Each expert keeps its own global scales. One language-model MoE layer packed: 288 experts. The other layers have not been opened. Modelopt does not capture a CUDA graph.
 
 | Task | State |
 | --- | --- |
@@ -123,7 +123,7 @@ Export: https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4
 - `kv_cache_scheme`: static FP8, no scale tensor in the index.
 - 45 layers: 34 `linear_attention`, 11 `deepseek_sparse_attention`. 3 dense MLPs, then 42 MoE layers. Hidden 4096, dense intermediate 12288, expert intermediate 2048, 288 routed experts, 1 shared, top-8, `routed_scaling_factor` 2.5, `norm_topk_prob` true, scoring `sigmoid`, `moe_router_dtype` `float32`, `swiglu_limit` 10. Linear attention 64 heads of dim 128. `qk_rope_head_dim` 0, `kv_lora_rank` 512, `index_topk` 2048, vocab 154880, context 1,048,576, one next-n layer.
 
-Codes are `.weight` dtype `U8`. There is no `weight_packed` and no `weight_global_scale`. The global weight scale is scalar `weight_scale_2`. The global activation factor is scalar `input_scale`. Gate and up may share `input_scale` and must keep distinct `weight_scale_2` values. Shard 1 showed one gate scale per layer, bitwise-equal up scales (697/697), and a different down scale. Task 6 compares one reference value per layer across experts **and** shards. A disagreement stops the load.
+Codes are `.weight` dtype `U8`. There is no `weight_packed` and no `weight_global_scale`. The global weight scale is scalar `weight_scale_2`. The global activation factor is scalar `input_scale`. Gate and up may share `input_scale` and must keep distinct `weight_scale_2` values. An early shard sample looked like one gate scale per layer. Language-model layer 3 does not: expert 0 is `5.8128720411332324e-05`, expert 1 is `4.650297705666162e-05`, expert 2 is `4.3596541217993945e-05`. Each expert keeps its own pair in its alpha slot. Two shards of the same expert must still agree. That disagreement stops the load.
 
 | Tensor | Stored shape | Logical GEMM |
 | --- | --- | --- |

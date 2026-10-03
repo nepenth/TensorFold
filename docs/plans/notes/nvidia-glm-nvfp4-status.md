@@ -27,6 +27,7 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 | `dec9b8f` | Fixture load. Routed experts and a dense layer with scales pack through `Fp4Linear.from_checkpoint`. Layer 45 names in the index are skipped. A draft head still raises. 37 Spark tests. Not a snapshot load. |
 | `2935fe8` | Packed-layer forward. One token matches `routed_decode` on the same table. Dense scales use `dense_eager`. Multi-row stays eager and is not graph-qualified. Grouped experts are not called. 20 Spark tests. Not a snapshot load. Not a serve. |
 | `cdbee00` | Synthetic engine step. Both ranks, one token, finite logits. Grouped experts are not called. No CUDA graph. Fixture hidden size is 128. `hc_mult` and the convolution width match the pinned config. Not a snapshot load. |
+| `51f420e` | Per-expert global scales. Each expert's `weight_scale_2` and `input_scale` land in its alpha slot. Same-expert shard disagreement still raises. 35 Spark tests. One language-model MoE layer packed: 288 experts, 864 linears. Not a full snapshot load. Not a serve. |
 
 On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
 
@@ -35,7 +36,7 @@ On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests pass
 ## Not implemented
 
 - CUDA graphs and a grouped device prefill GEMM. Task 10C packs on the host and reuses the lane eager oracle. That is not graph-qualified. One-token routed decode is indexed from the device table.
-- A snapshot load. A synthetic engine step returns finite logits. The pinned snapshot has not been opened. Its hidden size is 4096 with 288 routed experts. Modelopt does not capture a CUDA graph.
+- A full snapshot load. One language-model MoE layer packed: 288 experts, 864 linears. The other layers have not been opened. Modelopt does not capture a CUDA graph.
 - Two-rank digest, missing-peer timeout, captured NCCL.
 - A numeric envelope for the dense projection against a saved reference. The lane oracle uses `quant4`. That is not a reference match.
 - vLLM record, teacher-forced compare, long context, speed.
@@ -47,6 +48,6 @@ The skipped GPU tests have now passed on one Spark. A rank-local dense gate has 
 
 The dense lane eager oracle, the prompt eager oracle, and the routed eager oracle have passed on one Spark. Forty-six tests passed. Three two-GPU device-mismatch cases were skipped. Lane and prompt were not compared bitwise. A gate above 10 differs numerically from `mlp_prompt`. No numeric envelope. No shard pull. No serve.
 
-The pinned snapshot is local on both ranks: 33 shards, index hash `26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1`, config hash `41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf`. The archive config omitted the layer-45 ignore lines; the pinned config replaced it after the archive byte count matched. No serve. `spark-llm` is not advertised. A synthetic engine step passed at hidden size 128. The pinned hidden size is 4096 with 288 routed experts. Do not open the snapshot in this window until that pack is shown to fit. Modelopt does not capture a CUDA graph.
+The pinned snapshot is local on both ranks: 33 shards, index hash `26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1`, config hash `41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf`. The archive config omitted the layer-45 ignore lines; the pinned config replaced it after the archive byte count matched. No serve. `spark-llm` is not advertised. One language-model MoE layer packed. The other layers have not been opened. Modelopt does not capture a CUDA graph.
 
 Both Sparks are required for the recorded comparison and any speed number. Do not start `tensorfold serve` until the dry-run admission for the exact context exists. A serve in this window must not advertise `spark-llm`. Add that alias back only after the window is done, on the restored profile.
