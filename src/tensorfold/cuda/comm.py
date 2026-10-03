@@ -36,7 +36,7 @@ def _library() -> ctypes.CDLL:
 
 
 class NCCL:
-    def __init__(self, rank: int, world: int, master: str, port: int) -> None:
+    def __init__(self, rank: int, world: int, master: str, port: int, *, timeout: float = 600) -> None:
         from datetime import timedelta
 
         from torch.distributed import TCPStore
@@ -50,7 +50,7 @@ class NCCL:
         lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
         lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
                                       ctypes.c_void_p]
-        self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=600))
+        self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=timeout))
         uid = _UniqueId()
         if rank == 0:
             self._check(self.lib.ncclGetUniqueId(ctypes.byref(uid)))
