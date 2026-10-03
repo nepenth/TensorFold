@@ -17,7 +17,9 @@ def test_census_keeps_half_a_column_and_peaks_when_raw_reads_overlap():
     plan = admit.census(headers, layers=2)
     assert plan["keep"] == 8 + 50 + 40
     assert plan["steps"][0]["need"] == 8 + 50 + 100 + 80
+    assert plan["steps"][0]["increment"] == 50 + 100 + 80
     assert plan["steps"][1]["need"] == 8 + 50 + 40 + 80
+    assert plan["steps"][1]["increment"] == 40 + 80
     assert plan["peak"] == plan["steps"][0]["need"]
     assert plan["peak_layer"] == 0
     assert plan["unsplit_extra"] == 50 + 40

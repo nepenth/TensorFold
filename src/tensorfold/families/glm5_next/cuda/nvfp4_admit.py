@@ -132,8 +132,13 @@ def census(headers: Mapping[str, Mapping], *, already_split: bool = False,
         if index == 45:
             continue
         nxt = 0 if index + 1 == 45 else layer_read.get(index + 1, 0)
-        need = running + layer_keep[index] + layer_read[index] + nxt
-        steps.append({"layer": index, "need": need, "keep": layer_keep[index], "read": layer_read[index]})
+        # ``need`` is the running peak, including bytes already resident.
+        # ``increment`` is what this step can still allocate. The reserve check
+        # must use ``increment``: MemAvailable no longer includes the resident set.
+        increment = layer_keep[index] + layer_read[index] + nxt
+        need = running + increment
+        steps.append({"layer": index, "need": need, "increment": increment,
+                      "keep": layer_keep[index], "read": layer_read[index]})
         if need >= peak:
             peak = need
             peak_layer = index
@@ -209,4 +214,4 @@ def headers_from_reader(reader) -> tuple[dict, bool]:
 def steps_for(reader, layers: int) -> dict[int, int]:
     headers, already_split = headers_from_reader(reader)
     plan = census(headers, already_split=already_split, layers=layers)
-    return {row["layer"]: row["need"] for row in plan["steps"]}
+    return {row["layer"]: row["increment"] for row in plan["steps"]}
