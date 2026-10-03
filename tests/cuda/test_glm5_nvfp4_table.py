@@ -19,19 +19,23 @@ def _proj(n: int, k: int, scale: float, act: float, device: str) -> dict:
     }
 
 
-def _layer(device: str = "cuda", experts: int = 4) -> tuple[dict, dict]:
+def _layer(device: str = "cuda", experts: int = 4, *, unequal: bool = False) -> tuple[dict, dict]:
     scales = {"gate_proj": 1.25, "up_proj": 2.5, "down_proj": 0.5}
     routed = {
-        e: {proj: _proj(64, 64, scale, 0.5, device) for proj, scale in scales.items()}
+        e: {proj: _proj(64, 64, scale * (e + 1) if unequal else scale,
+                       0.5 * (e + 1) if unequal else 0.5, device) for proj, scale in scales.items()}
         for e in range(experts)
     }
     shared = {proj: torch.zeros((64, 64), dtype=torch.bfloat16, device=device) for proj in table.PROJECTIONS}
     return routed, shared
 
 
-def test_e4_pointer_table_aliases_the_owner():
-    routed, shared = _layer()
-    loaded = table.load_synthetic_layer(layer=3, experts=routed, shared=shared)
+@pytest.mark.parametrize("unequal", [False, True], ids=["equal-scales", "unequal-scales"])
+@pytest.mark.parametrize("loader", [table.load_synthetic_layer, table.load_checkpoint_layer],
+                         ids=["synthetic", "checkpoint"])
+def test_e4_pointer_table_aliases_the_owner(unequal, loader):
+    routed, shared = _layer(unequal=unequal)
+    loaded = loader(layer=3, experts=routed, shared=shared)
     assert loaded.experts == 4 and loaded.combine_weight == 1.0
     assert not hasattr(loaded, "draft_head")
     assert loaded.words_ptr.dtype == torch.int64
@@ -40,6 +44,11 @@ def test_e4_pointer_table_aliases_the_owner():
         assert int(loaded.words_ptr[row, col].item()) == linear.words.data_ptr()
         assert int(loaded.bs_ptr[row, col].item()) == linear.bs.data_ptr()
         assert loaded.words_ptr.data_ptr() != linear.words.data_ptr()
+        tensors = routed[row][table.PROJECTIONS[col]]
+        scale, act = float(tensors["weight_scale_2"]), float(tensors["input_scale"])
+        assert (linear.scale, linear.act) == (scale, act)
+        assert float(loaded.alpha[row, col]) == table.rounded_alpha(act, scale)
+    assert len(set(loaded.alpha[:, 0].tolist())) == (4 if unequal else 1)
     gate, up = loaded.linears[0], loaded.linears[1]
     assert gate.scale == 1.25 and up.scale == 2.5 and gate.act == 0.5
     assert gate.scale != 1.0 / 1.25

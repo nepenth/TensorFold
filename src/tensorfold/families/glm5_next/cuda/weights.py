@@ -446,7 +446,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             scale = float(t(prefix + "weight_scale_2").reshape(-1)[0])
             act = float(t(prefix + "input_scale").reshape(-1)[0])
             built.append(Fp4Linear.from_checkpoint(weight, wscale, scale, act=act))
-            scales[proj] = (scale, act)
+            scales[proj] = [(scale, act)]
         return nvfp4_table._assemble(i, built, scales, {})
 
     layer_events: list = []                              # each layer's event, recorded once its work is queued

@@ -155,8 +155,8 @@ def _ordered(experts: Mapping[int, Mapping[str, Mapping[str, torch.Tensor]]]) ->
     return [experts[i] for i in keys]
 
 
-def _scales(blocks: list, proj: str) -> tuple[float, float]:
-    weight_scales, activations = [], []
+def _scales(blocks: list, proj: str) -> list[tuple[float, float]]:
+    scales = []
     for index, block in enumerate(blocks):
         name = f"experts.{index}.{proj}"
         if proj not in block:
@@ -165,16 +165,9 @@ def _scales(blocks: list, proj: str) -> tuple[float, float]:
         for key in ROUTED_KEYS:
             if key not in tensors:
                 raise ValueError(f"{name}: missing {key}")
-        weight_scales.append(_scalar(name, "weight_scale_2", tensors["weight_scale_2"]))
-        activations.append(_scalar(name, "input_scale", tensors["input_scale"]))
-    return _agree(weight_scales, f"{proj} weight_scale_2"), _agree(activations, f"{proj} input_scale")
-
-
-def _agree(values: list[float], what: str) -> float:
-    bits = [_f32_bits(v) for v in values]
-    if any(item != bits[0] for item in bits):
-        raise ValueError(f"{what} disagrees across experts")
-    return values[0]
+        scales.append((_scalar(name, "weight_scale_2", tensors["weight_scale_2"]),
+                       _scalar(name, "input_scale", tensors["input_scale"])))
+    return scales
 
 
 def _check_shared(shared: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -204,7 +197,7 @@ def load_synthetic_layer(
     shared: Mapping[str, torch.Tensor],
     shards: list[Mapping[int, Mapping[str, Mapping[str, torch.Tensor]]]] | None = None,
 ) -> RoutedTable:
-    """Pack one synthetic layer. Scale disagreement raises before any expert is packed."""
+    """Pack one synthetic layer. Same-expert shard disagreement raises before packing."""
 
     return _load_layer(layer=layer, experts=experts, shared=shared, shards=shards, synthetic=True)
 
@@ -227,12 +220,10 @@ def _load_layer(*, layer: int, experts: Mapping, shared: Mapping, shards: list |
     if layer < 0:
         raise ValueError(f"layer {layer} is not a routed layer")
     blocks = _ordered(experts)
-    for proj in PROJECTIONS:
-        _scales(blocks, proj)
+    scales = {proj: _scales(blocks, proj) for proj in PROJECTIONS}
     for extra in shards or ():
         _same_shard(blocks, _ordered(extra))
     shared_weights = _check_shared(shared)
-    scales = {proj: _scales(blocks, proj) for proj in PROJECTIONS}
     if synthetic:
         _refuse_production(blocks)
     built: list[Fp4Linear] = []
@@ -240,7 +231,7 @@ def _load_layer(*, layer: int, experts: Mapping, shared: Mapping, shards: list |
         for index, block in enumerate(blocks):
             for proj in PROJECTIONS:
                 tensors = block[proj]
-                weight_scale_2, act = scales[proj]
+                weight_scale_2, act = scales[proj][index]
                 built.append(Fp4Linear.from_checkpoint(
                     tensors["weight"], tensors["weight_scale"], weight_scale_2, act=act))
         return _assemble(layer, built, scales, shared_weights)
@@ -255,11 +246,14 @@ def _same_shard(primary: list, extra: list) -> None:
     for proj in PROJECTIONS:
         left = _scales(primary, proj)
         right = _scales(extra, proj)
-        if _f32_bits(left[0]) != _f32_bits(right[0]) or _f32_bits(left[1]) != _f32_bits(right[1]):
-            raise ValueError(f"{proj} disagrees across shards")
+        for index, (a, b) in enumerate(zip(left, right)):
+            for key, x, y in zip(("weight_scale_2", "input_scale"), a, b):
+                if _f32_bits(x) != _f32_bits(y):
+                    raise ValueError(f"experts.{index}.{proj} {key} disagrees across shards")
 
 
-def _assemble(layer: int, built: list[Fp4Linear], scales: dict, shared: dict[str, torch.Tensor]) -> RoutedTable:
+def _assemble(layer: int, built: list[Fp4Linear], scales: dict[str, list[tuple[float, float]]],
+              shared: dict[str, torch.Tensor]) -> RoutedTable:
     experts = len(built) // len(PROJECTIONS)
     device = built[0].words.device
     words_ptr = torch.empty((experts, len(PROJECTIONS)), dtype=torch.int64, device=device)
@@ -273,6 +267,6 @@ def _assemble(layer: int, built: list[Fp4Linear], scales: dict, shared: dict[str
         bs_ptr[row, col] = linear.bs.data_ptr()
         n[row, col] = linear.n
         k[row, col] = linear.k
-        weight_scale_2, act = scales[PROJECTIONS[col]]
+        weight_scale_2, act = scales[PROJECTIONS[col]][row]
         alpha[row, col] = rounded_alpha(act, weight_scale_2)
     return RoutedTable(built, words_ptr, bs_ptr, n, k, alpha, shared, 1.0, experts, layer)

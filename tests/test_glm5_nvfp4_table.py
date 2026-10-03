@@ -1,4 +1,4 @@
-"""CPU checks for the synthetic routed-expert table. No packing and no kernel."""
+"""CPU checks for the routed-expert table, with a stub packer and no kernel."""
 
 from __future__ import annotations
 
@@ -22,29 +22,64 @@ def test_missing_weight_scale_raises_before_packing():
         table.load_synthetic_layer(layer=3, experts=experts, shared={})
 
 
-def test_weight_scale_disagreement_stops_the_load():
-    def block(scale: float) -> dict:
-        return {proj: {
-            "weight": object(), "weight_scale": object(),
-            "weight_scale_2": torch.tensor(scale), "input_scale": torch.tensor(0.5),
-        } for proj in table.PROJECTIONS}
-
-    experts = {0: block(1.25), 1: block(1.5)}
-    with pytest.raises(ValueError, match="weight_scale_2 disagrees"):
-        table.load_synthetic_layer(layer=3, experts=experts, shared={"gate_proj": torch.zeros(1, dtype=torch.bfloat16)})
-
-
-def test_shard_disagreement_stops_the_load():
-    def block(scale: float) -> dict:
-        return {proj: {
-            "weight": object(), "weight_scale": object(),
-            "weight_scale_2": torch.tensor(scale), "input_scale": torch.tensor(0.5),
-        } for proj in table.PROJECTIONS}
-
-    primary = {0: block(1.25)}
-    other = {0: block(2.5)}
+def _layer(scales: tuple, acts: tuple) -> tuple[dict, dict]:
+    experts = {e: {proj: {
+        "weight": object(), "weight_scale": object(),
+        "weight_scale_2": torch.tensor(scale * (col + 1)), "input_scale": torch.tensor(act),
+    } for col, proj in enumerate(table.PROJECTIONS)}
+        for e, (scale, act) in enumerate(zip(scales, acts))}
     shared = {proj: torch.zeros(1, dtype=torch.bfloat16) for proj in table.PROJECTIONS}
-    with pytest.raises(ValueError, match="disagrees across shards"):
+    return experts, shared
+
+
+UNEQUAL_SCALES = (5.8128720411332324e-05, 4.650297705666162e-05, 4.3596541217993945e-05)
+
+
+@pytest.mark.parametrize("scales,acts", [
+    ((1.25,) * 3, (0.5,) * 3),
+    (UNEQUAL_SCALES, (0.5,) * 3),
+    ((1.25,) * 3, (0.5, 0.75, 1.0)),
+    (UNEQUAL_SCALES, (0.5, 0.75, 1.0)),
+], ids=["equal", "unequal-weight", "unequal-input", "unequal-both"])
+@pytest.mark.parametrize("checkpoint", [False, True], ids=["synthetic", "checkpoint"])
+def test_each_expert_keeps_its_scales_and_alpha(monkeypatch, scales, acts, checkpoint):
+    def pack(weight, weight_scale, scale, *, act):
+        return Fp4Linear(torch.zeros((1, 1, 8, 32, 2), dtype=torch.int32),
+                         torch.zeros((1, 1, 64, 4), dtype=torch.uint8), scale, 64, 64, act=act)
+
+    monkeypatch.setattr(Fp4Linear, "from_checkpoint", pack)
+    experts, shared = _layer(scales, acts)
+    if checkpoint:
+        loaded = table.load_checkpoint_layer(layer=3, experts=experts, shared=shared)
+    else:
+        # Same-expert replicas MUST agree even when the experts differ from each other.
+        loaded = table.load_synthetic_layer(layer=3, experts=experts, shared=shared,
+                                           shards=[dict(reversed(list(experts.items())))])
+    assert loaded.experts == 3 and len(loaded.linears) == 9
+    for slot, linear in enumerate(loaded.linears):
+        e, col = divmod(slot, 3)
+        tensors = experts[e][table.PROJECTIONS[col]]
+        scale, act = float(tensors["weight_scale_2"]), float(tensors["input_scale"])
+        assert (linear.scale, linear.act) == (scale, act)
+        assert float(loaded.alpha[e, col]) == table.rounded_alpha(act, scale)
+    for col in range(3):
+        distinct = len(set(loaded.alpha[:, col].tolist()))
+        assert distinct == (1 if scales[0] == scales[1] and acts[0] == acts[1] else 3)
+
+
+@pytest.mark.parametrize("expert", [0, 2])
+@pytest.mark.parametrize("proj", table.PROJECTIONS)
+@pytest.mark.parametrize("key", ["weight_scale_2", "input_scale"])
+def test_shard_disagreement_stops_the_load(monkeypatch, expert, proj, key):
+    primary, shared = _layer(UNEQUAL_SCALES, (0.5, 0.75, 1.0))
+    other, _ = _layer(UNEQUAL_SCALES, (0.5, 0.75, 1.0))
+    other[expert][proj][key] *= 2
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("same-expert shard disagreement MUST raise before packing")
+
+    monkeypatch.setattr(Fp4Linear, "from_checkpoint", forbidden)
+    with pytest.raises(ValueError, match=rf"experts\.{expert}\.{proj} {key} disagrees across shards"):
         table.load_synthetic_layer(layer=3, experts=primary, shared=shared, shards=[other])
 
 
