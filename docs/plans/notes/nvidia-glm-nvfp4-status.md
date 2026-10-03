@@ -27,7 +27,7 @@ On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests pass
 
 ## Not implemented
 
-- Packed prefill and CUDA graphs. One-token routed decode is indexed from the device table. Multi-token prefill is not.
+- CUDA graphs and a grouped device prefill GEMM. Task 10C packs on the host and reuses the lane eager oracle. That is not graph-qualified. One-token routed decode is indexed from the device table.
 - A snapshot load. `load()` still raises `NVFP4 tensors are not wired`.
 - Two-rank digest, missing-peer timeout, captured NCCL.
 - A numeric envelope for the dense projection against a saved reference. The lane oracle uses `quant4`. That is not a reference match.
@@ -40,6 +40,6 @@ The skipped GPU tests have now passed on one Spark. A rank-local dense gate has 
 
 The dense lane eager oracle, the prompt eager oracle, and the routed eager oracle have passed on one Spark. Forty-six tests passed. Three two-GPU device-mismatch cases were skipped. Lane and prompt were not compared bitwise. A gate above 10 differs numerically from `mlp_prompt`. No numeric envelope. No shard pull. No serve.
 
-The next single-Spark gate is Task 10C: prefill counts, a stable pack, and a deterministic combine. Task 10B passed on one Spark for one token: eight experts, distinct intermediate quants, the shared BF16 branch, and an ordered combine. No shard pull. No serve.
+The next single-Spark gate is Task 9A: row-split gate and up, column-split down, ordered fp32 sum. Task 10C passed on one Spark: counts, exclusive prefix sums, a stable pack, scatter to `[token, slot]`, and `glue.combine` in slot order. It reuses the lane eager oracle. It is not a grouped device GEMM and it is not graph-qualified. No shard pull. No serve.
 
 Both Sparks are required for NCCL, graph replay across ranks, the recorded comparison, and any speed number. Do not pull the 190.4 GiB snapshot, and do not start `tensorfold serve`, until those single-Spark gates have passed. The approved window already names how the previous serve is restored. That is not a license to start Task 12.
