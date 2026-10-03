@@ -1,6 +1,6 @@
 # GLM NVFP4 status
 
-Branch: `plan/glm-nvidia-nvfp4`. Plan: `docs/plans/2026-10-02-glm-nvidia-nvfp4.md`. Updated 2026-10-02 after the synthetic pointer-table pass.
+Branch: `plan/glm-nvidia-nvfp4`. Plan: `docs/plans/2026-10-02-glm-nvidia-nvfp4.md`. Updated 2026-10-02 after the prompt and routed eager oracles.
 
 Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e38352348`. Reference: `BLOCKED_REFERENCE` (`nvidia-glm-nvfp4-reference.md`). No weight shard has been downloaded. The previous serve was a different checkpoint. It was stopped under an approved window. Restore steps are not in this public tree. The previous weights were left on disk.
 
@@ -17,6 +17,7 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 | `90ce7a8` | CPU splits. Scalars replicate. Packed width 96 is rejected. Rank-folder provenance is checked. |
 | `0203859` | Logical activation codec, prepared-row layout (`k64-mpad-4`), and `nvfp4_inventory`. |
 | `585faa1` | Dense lane eager oracle. Common-input quant, `glue.swiglu`, one down into the caller fp32 buffer. Sixteen Spark tests. Not a reference envelope. |
+| this commit | Prompt eager oracle and routed eager oracle. Lane and prompt are not compared bitwise. Each down reads its own intermediate. Shared BF16 MLP still contributes when every routed weight is zero. |
 
 On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
 
@@ -24,7 +25,7 @@ On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests pass
 
 ## Not implemented
 
-- Device-indexed expert dispatch, the prompt eager oracle, the routed eager oracle, packed prefill, CUDA graphs.
+- Device-indexed expert dispatch, packed prefill, CUDA graphs.
 - A snapshot load. `load()` still raises `NVFP4 tensors are not wired`.
 - Two-rank digest, missing-peer timeout, captured NCCL.
 - A numeric envelope for the dense projection against a saved reference. The lane oracle uses `quant4`. That is not a reference match.
@@ -35,8 +36,8 @@ On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests pass
 
 The skipped GPU tests have now passed on one Spark. A rank-local dense gate has been packed and run through the existing lane kernel and the prompt GEMM. A synthetic routed layer is a single-owner pointer table. Outputs of the dense gate were finite bf16. Recorded `split_k` is 2. No numeric envelope. No shard pull. No serve.
 
-The dense lane eager oracle has passed on one Spark: 16 tests, same-backend bitwise, a refused destination left untouched, and a gate above 10 differs from `mlp_prompt`. Lane and prompt were not compared bitwise. No numeric envelope. No shard pull. No serve.
+The dense lane eager oracle, the prompt eager oracle, and the routed eager oracle have passed on one Spark. Forty-six tests passed. Three two-GPU device-mismatch cases were skipped. Lane and prompt were not compared bitwise. A gate above 10 differs numerically from `mlp_prompt`. No numeric envelope. No shard pull. No serve.
 
-The next single-Spark gate is the prompt oracle and the routed oracle, then the dispatch sanitizer. A private continuation loop advances that batch if this session stops. It does not start a serve.
+The next single-Spark gate is Task 10A: one device-indexed projection and Compute Sanitizer on a tiny fixture. A skipped sanitizer is a limitation, not a pass. A private continuation loop advances that batch if this session stops. It does not start a serve.
 
 Both Sparks are required for NCCL, graph replay across ranks, the recorded comparison, and any speed number. Do not pull the 190.4 GiB snapshot, and do not start `tensorfold serve`, until those single-Spark gates have passed. The approved window already names how the previous serve is restored. That is not a license to start Task 12.
