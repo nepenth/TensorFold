@@ -20,6 +20,7 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 | `4383001` | Prompt eager oracle and routed eager oracle. Lane and prompt are not compared bitwise. Each down reads its own intermediate. Shared BF16 MLP still contributes when every routed weight is zero. |
 | `50ddfcf` | One device-indexed projection. 64-bit table address, existing lane kernel, 66 Spark tests. Sanitizer zero errors on the canary only. |
 | `b1b583e` | One-token routed decode from the device table. Eight experts, distinct intermediate quants, shared BF16 branch, ordered combine. 29 Spark tests. |
+| `9a709ee` | Prefill pack and slot-ordered combine. Lane eager oracle, not a grouped device GEMM, not graph-qualified. 59 Spark tests. |
 
 On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
 
