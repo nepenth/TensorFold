@@ -17,7 +17,7 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
 
 from test_glm5_nvfp4_config import _config
 from tensorfold.cuda.nvfp4 import checkpoint, linear as fp4
-from tensorfold.families.glm5_next.cuda import nvfp4_dispatch, nvfp4_table as table, weights
+from tensorfold.families.glm5_next.cuda import decode, forward, glue, nvfp4_dispatch, nvfp4_table as table, weights
 from tensorfold.families.glm5_next.cuda.qmm import B16
 from tensorfold.families.glm5_next.cuda.split import RankReader, split_file, write
 
@@ -33,13 +33,13 @@ def _save(path, tensors):
     ], None)
 
 
-def _checkpoint(tmp_path, *, extra=None, dense_nvfp4=False):
+def _checkpoint(tmp_path, *, extra=None, dense_nvfp4=False, hc_mult=1, conv=2):
     """E=4, D=128, rank-local MoE width=64; BF16 KDA/dense and DSA/MoE layers."""
     config = _config()
     config["text_config"].update(
         hidden_size=128, num_hidden_layers=3, num_attention_heads=2, q_lora_rank=64, kv_lora_rank=64,
         qk_nope_head_dim=128, v_head_dim=384, moe_intermediate_size=128, intermediate_size=128,
-        linear_num_heads=2, linear_conv_kernel_dim=2, hc_mult=1,
+        linear_num_heads=2, linear_conv_kernel_dim=conv, hc_mult=hc_mult,
         index_n_heads=2, index_head_dim=32,
         layer_types=["linear_attention", "deepseek_sparse_attention", "deepseek_sparse_attention"],
         mlp_layer_types=["dense", "sparse", "sparse"],
@@ -56,8 +56,9 @@ def _checkpoint(tmp_path, *, extra=None, dense_nvfp4=False):
     for i in range(3):
         base = PREFIX + f"layers.{i}."
         for site in ("attn", "ffn"):
-            bf(base + f"hc_{site}_fn", (3, 128))
-            bf(base + f"hc_{site}_base", (3,), torch.float32)
+            mixes = 2 * hc_mult + hc_mult * hc_mult
+            bf(base + f"hc_{site}_fn", (mixes, hc_mult * 128))
+            bf(base + f"hc_{site}_base", (mixes,), torch.float32)
             bf(base + f"hc_{site}_scale", (3,), torch.float32)
         for name in ("input_layernorm", "post_attention_layernorm"):
             bf(base + name + ".weight", (128,))
@@ -68,7 +69,7 @@ def _checkpoint(tmp_path, *, extra=None, dense_nvfp4=False):
             for proj in ("f_a", "g_a"):
                 bf(p + proj + "_proj.weight", (128, 128))
             for proj in "qkv":
-                bf(p + proj + "_conv1d.weight", (256, 1, 2))
+                bf(p + proj + "_conv1d.weight", (256, 1, conv))
             bf(p + "A_log", (2,), torch.float32)
             bf(p + "dt_bias", (256,), torch.float32)
             bf(p + "o_norm.weight", (128,))
@@ -207,6 +208,47 @@ def test_e4_numeric_fixture_uses_the_loaded_addresses(tmp_path):
         assert nvfp4_dispatch.projection(checkpoint.quant4(x, linear.act), routed, e, col, out) is out
         assert torch.isfinite(out).all() and out.abs().max() > 0
         assert torch.equal(out.view(torch.int32), expected.view(torch.int32))
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@torch.no_grad()
+def test_e4_loaded_engine_one_token_is_finite_and_eager(tmp_path, monkeypatch, rank):
+    # Existing engine kernels need four HC streams and four KDA convolution
+    # taps. Four HC blocks cover D=128's 512 columns in 128-column partials.
+    _checkpoint(tmp_path, hc_mult=4, conv=4)
+    monkeypatch.setattr(glue, "HC_BLOCKS", 4)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("a RoutedTable MUST NOT reach grouped expert dispatch or CUDA graph capture")
+
+    for name in ("route", "gate_up", "down"):
+        monkeypatch.setattr(forward.grouped, name, forbidden)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", forbidden)
+    monkeypatch.setattr(torch.cuda, "graph", forbidden)
+
+    loaded = weights.load(tmp_path, rank=rank, mtp=False)
+    assert loaded.cfg.quant == "modelopt" and loaded.cfg.experts == 4
+    assert loaded.mtp is None and loaded.draft_head is None
+    assert isinstance(loaded.layers[0].mlp.gu, B16)
+    routed = [layer.moe.experts for layer in loaded.layers if layer.moe is not None]
+    assert len(routed) == 2 and all(isinstance(t, table.RoutedTable) for t in routed)
+    seen = []
+    real_decode = forward.routed_decode
+
+    def record(x, packed, *args, **kwargs):
+        seen.append(packed)
+        return real_decode(x, packed, *args, **kwargs)
+
+    monkeypatch.setattr(forward, "routed_decode", record)
+    engine = decode.Engine(loaded, capacity=8, max_rows=1, prefill_rows=1, graphs=False)
+    engine.buf.logits.fill_(float("nan"))
+    logits = engine.forward([7])
+    torch.cuda.synchronize()
+    assert logits.shape == (1, loaded.cfg.vocab // loaded.world)
+    assert bool(torch.isfinite(logits).all())
+    assert [id(t) for t in seen] == [id(t) for t in routed]
+    assert engine.graphs is None
+    assert engine.replays == {"main": 0, "sparse": 0, "mtp": 0, "sparse_mtp": 0, "eager": 1}
 
 
 @pytest.mark.parametrize("name,match", [
