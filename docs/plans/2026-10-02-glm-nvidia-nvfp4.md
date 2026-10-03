@@ -45,7 +45,7 @@ CPU work through the allocation inventory is on the branch. `load()` still raise
 Stop here for a full load. The machines are free. The next command is still not `tensorfold serve`.
 
 1. On one Spark, with PyTorch CUDA: Task 5C–5D has run one dense gate through `lane` and the prompt GEMM. Finite bf16, `split_k` 2. No numeric envelope yet. No second model, no weight-shard delete.
-2. On one Spark: the synthetic pointer table has passed. The dense lane eager oracle, the prompt eager oracle, and the routed eager oracle have passed. Lane and prompt were not compared bitwise. Each down reads its own intermediate. The shared expert is the BF16 MLP and still contributes when every routed weight is zero. Next is Task 10A–10C. Compute Sanitizer on a tiny fixture. No snapshot pull.
+2. On one Spark: the synthetic pointer table has passed. The dense, prompt, and routed eager oracles have passed. Task 10A has passed: one projection is selected by a 64-bit address in the device table and matches the lane oracle bitwise, including a second expert id. Compute Sanitizer memcheck and initcheck reported zero errors on the canary fixture. That does not qualify every shape. Next is Task 10B–10C. No snapshot pull.
 3. On both Sparks: Task 9B–9C (real NCCL, missing peer, mismatched digest) and Task 10D graph replay. This is the first step that cannot be done on a single machine.
 4. Approved window only, after those gates: pull or reuse the 190.4 GiB snapshot at revision `da920bb`, record vLLM, run TensorFold, restore the previous serve. Task 12, then 13, then 14.
 

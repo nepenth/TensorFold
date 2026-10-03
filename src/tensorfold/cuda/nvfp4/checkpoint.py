@@ -38,7 +38,8 @@ def _ext():
 
     here = Path(__file__).parent
     return load(name="tensorfold_nvfp4_ck_v6",
-                sources=[str(here / "checkpoint.cpp"), str(here / "act.cu"), str(here / "lane4.cu"),
+                sources=[str(here / "checkpoint.cpp"), str(here / "dispatch.cpp"),
+                         str(here / "act.cu"), str(here / "lane4.cu"),
                          str(here / "gemm_ck.cu"), str(here / "gemm_ws.cu")],
                 need=MIN_CAPABILITY, arch_specific=precision.own_math(_capability())["nvfp4"],
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3"], verbose=False)

@@ -1,6 +1,8 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 
+void bind_dispatch(pybind11::module_&);
+
 void quant4_cuda(const at::Tensor&, double, at::Tensor&, at::Tensor&, int64_t, int64_t);
 void quant8_cuda(const at::Tensor&, double, at::Tensor&, int64_t, int64_t);
 void lane_cuda(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, double, at::Tensor&,
@@ -161,6 +163,7 @@ void gemm_gu_ck(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& wg,
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    bind_dispatch(m);
     m.def("quant4", &quant4);
     m.def("quant8", &quant8);
     m.def("lane", &lane);
