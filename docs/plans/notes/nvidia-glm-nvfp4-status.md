@@ -41,6 +41,6 @@ The skipped GPU tests have now passed on one Spark. A rank-local dense gate has 
 
 The dense lane eager oracle, the prompt eager oracle, and the routed eager oracle have passed on one Spark. Forty-six tests passed. Three two-GPU device-mismatch cases were skipped. Lane and prompt were not compared bitwise. A gate above 10 differs numerically from `mlp_prompt`. No numeric envelope. No shard pull. No serve.
 
-The next single-Spark gate is Task 9A: row-split gate and up, column-split down, ordered fp32 sum. Task 10C passed on one Spark: counts, exclusive prefix sums, a stable pack, scatter to `[token, slot]`, and `glue.combine` in slot order. It reuses the lane eager oracle. It is not a grouped device GEMM and it is not graph-qualified. No shard pull. No serve.
+The next gates need both Sparks or an approved snapshot. Task 9A passed on one Spark: row-split gate and up concatenate in rank order, column-split down is an fp32 sum with rank 0 first, and `split_k` is recorded on both shapes. No numeric envelope is frozen. No NCCL. No shard pull. No serve.
 
-Both Sparks are required for NCCL, graph replay across ranks, the recorded comparison, and any speed number. Do not pull the 190.4 GiB snapshot, and do not start `tensorfold serve`, until those single-Spark gates have passed. The approved window already names how the previous serve is restored. That is not a license to start Task 12.
+Both Sparks are required for NCCL, graph replay across ranks, the recorded comparison, and any speed number. Do not pull the 190.4 GiB snapshot, and do not start `tensorfold serve`, until those two-rank gates have passed. The approved window already names how the previous serve is restored. That is not a license to start Task 12.
