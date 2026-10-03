@@ -24,7 +24,7 @@ Decode and prefill share weights and the numeric meaning of a projection. They d
 
 Tracking note: `docs/plans/notes/nvidia-glm-nvfp4-status.md`. Branch `plan/glm-nvidia-nvfp4`. Checkpoint revision `da920bb0b9f4a06727223a349e55468e38352348`. Reference status `BLOCKED_REFERENCE`.
 
-CPU work through the allocation inventory is on the branch. A synthetic fixture packs routed experts and a dense layer that has scales, and one token matches the existing eager kernels. The pinned snapshot is local and has not been opened. Modelopt does not capture a CUDA graph.
+CPU work through the allocation inventory is on the branch. A synthetic engine step returns finite logits at hidden size 128. The pinned snapshot is local, hidden size 4096, 288 routed experts, and has not been opened. Modelopt does not capture a CUDA graph.
 
 | Task | State |
 | --- | --- |
