@@ -100,7 +100,8 @@ class Engine:
         self.draft_n = w.head.n
         self.graphs = None
         self.replays = {"main": 0, "sparse": 0, "mtp": 0, "sparse_mtp": 0, "eager": 0}   # steps by path
-        if graphs:
+        # Packed NVFP4 uses eager validation/dispatch, including host synchronization.
+        if graphs and w.cfg.quant != "modelopt":
             from .graphs import Graphs
 
             self.graphs = Graphs(self, graph_rows, graph_rows)

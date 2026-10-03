@@ -1,4 +1,4 @@
-"""GLM-5.3-Flash's tensor-parallel forward and commit; kernels keep rows apart, so row r has the serial step's bits."""
+"""GLM-5.3-Flash's tensor-parallel forward and commit, with eager packed NVFP4 MLPs."""
 
 from __future__ import annotations
 
@@ -17,6 +17,9 @@ from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
 from . import exl3_generic, glue, kda as kda_mod, latent, prof, qmm, sparse
 from .attention import AttnScratch, attention, kv_write
+from .nvfp4_eager import dense_eager, routed_eager
+from .nvfp4_routed import routed_decode
+from .nvfp4_table import RoutedTable
 from .weights import LayerW, Weights
 
 
@@ -383,6 +386,9 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
 
 
 def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
+    if layer.dense_nvfp4 is not None:
+        dense_eager(b.normed[:R], *layer.dense_nvfp4.linears, b.part[:R], limit=w.cfg.limit)
+        return gather(w, b, R)
     m = layer.mlp
     mm(b, b.normed[:R], m.gu, b.xs[:R], b.gu[:R])
     glue.swiglu(b.gu[:R], b.act[:R], b.xs_act[:R], w.cfg.limit)
@@ -395,8 +401,27 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
     with prof.timed("moe: route"):
         glue.router(b.normed[:R], m.router, b.mlog[:R])
         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
-        if m.shared is None:
+        if m.shared is None and not isinstance(m.experts, RoutedTable):
             grouped.route(b.pick[:R], b.plan)
+    if isinstance(m.experts, RoutedTable):
+        table = m.experts
+        ids = b.pick[:R, :c.top_k].to(torch.int64)
+        weights = b.wts[:R, :c.top_k]
+        if R == 1:
+            residual_act, intermediate_act = table.linears[0].act, table.linears[2].act
+            if residual_act is None or intermediate_act is None or any(
+                lin.act != (intermediate_act if slot % 3 == 2 else residual_act)
+                for slot, lin in enumerate(table.linears)
+            ):
+                raise ValueError("routed decode needs common static gate/up and down input factors")
+            routed_decode(b.normed[:R], table, ids, weights, b.part[:R],
+                          residual_act=residual_act, intermediate_act=intermediate_act, limit=c.limit)
+        else:
+            # Multi-row prefill remains eager; lane and prompt reductions have different bits.
+            experts = [tuple(table.linears[i:i + 3]) for i in range(0, len(table.linears), 3)]
+            routed_eager(b.normed[:R], experts, table.shared, ids, weights, b.part[:R],
+                         backend="prompt" if b.prefill else "lane", limit=c.limit)
+        return gather(w, b, R)
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         exl3_generic.routed(b.normed[:R], b.pick, m.experts, b.exl3, R, c.limit)
@@ -437,8 +462,9 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
         h = layer.ffn_hc
         glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
                     b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters)
-    with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
-        g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
+    dense = layer.mlp is not None or layer.dense_nvfp4 is not None
+    with prof.timed("mlp" if dense else "moe (total)"):
+        g = mlp_block(layer, w, b, R) if dense else moe_block(layer, w, b, R)
     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
 
 
@@ -467,7 +493,7 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
 
 def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
             host_pos: int | None = None, sparse_np: int | None = None, cut: Cut | None = None):
-    """Run capturable GPU work on static buffers and device positions; eager long contexts use host_pos (graphs sparse_np) to select sparse attention."""
+    """Compute on static buffers; NVFP4 MLPs remain eager. Long contexts use host_pos (graphs sparse_np)."""
 
     if cut is not None and (not b.prefill or not 0 < cut.point < R):
         raise ValueError("a prompt cut must lie inside a prefill chunk")
