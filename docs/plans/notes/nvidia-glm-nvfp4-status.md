@@ -1,6 +1,6 @@
 # GLM NVFP4 status
 
-Branch: `plan/glm-nvidia-nvfp4`. Plan: `docs/plans/2026-10-02-glm-nvidia-nvfp4.md`. Updated 2026-10-03 after the header census and the per-layer host reserve.
+Branch: `plan/glm-nvidia-nvfp4`. Plan: `docs/plans/2026-10-02-glm-nvidia-nvfp4.md`. Updated 2026-10-03 after one measured layer and the incremental host reserve.
 
 Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e38352348`. Reference: `BLOCKED_REFERENCE` (`nvidia-glm-nvfp4-reference.md`). The pinned snapshot is local on both ranks. The previous serve was a different checkpoint. It was stopped under an approved window. Restore steps are not in this public tree.
 
@@ -29,6 +29,7 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 | `cdbee00` | Synthetic engine step. Both ranks, one token, finite logits. Grouped experts are not called. No CUDA graph. Fixture hidden size is 128. `hc_mult` and the convolution width match the pinned config. Not a snapshot load. |
 | `51f420e` | Per-expert global scales. Each expert's `weight_scale_2` and `input_scale` land in its alpha slot. Same-expert shard disagreement still raises. 35 Spark tests. One language-model MoE layer packed: 288 experts, 864 linears. Not a full snapshot load. Not a serve. |
 | `159d73e` | Header census and a per-layer host reserve. One rank keeps 89.200 GiB. Peak 92.632 GiB at layer 43 if the packed layer overlaps the current reader's raw spans. Four CPU tests. No resident load. No serve. |
+| `df46d92` | The reserve check uses the layer increment, not the running peak. Four CPU tests. No resident load. No serve. |
 
 On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
 
@@ -37,7 +38,7 @@ On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests pass
 ## Not implemented
 
 - CUDA graphs and a grouped device prefill GEMM. Task 10C packs on the host and reuses the lane eager oracle. That is not graph-qualified. One-token routed decode is indexed from the device table.
-- A resident snapshot load. The header census did not allocate. One rank keeps 95,777,735,492 bytes (89.200 GiB). The running peak is 99,462,461,744 bytes (92.632 GiB) at layer 43 if the packed layer overlaps the current reader's raw spans of that layer and the next. Those spans still include the other rank's columns. An in-process abort is in front of each layer and requires a 16 GiB host reserve. A cgroup cap is not that check. The load has not started. Modelopt does not capture a CUDA graph.
+- A resident snapshot load. The header census did not allocate the full rank. One rank keeps 95,777,735,492 bytes (89.200 GiB). The running peak is 99,462,461,744 bytes (92.632 GiB) at layer 43 if the packed layer overlaps the current reader's raw spans of that layer and the next. One MoE layer, then a second, were packed and dropped: each retained 2,063,597,568 bytes (1.921875 GiB) and peaked at 4,107,894,784 bytes allocated. The second drop returned host available to the same level. Forty-two such tables are 80.71875 GiB. The reserve check now asks for that layer's increment, not the running peak, because available memory no longer includes bytes already resident. A cgroup cap is not that check. The full load has not started. Modelopt does not capture a CUDA graph.
 - Two-rank digest, missing-peer timeout, captured NCCL.
 - A numeric envelope for the dense projection against a saved reference. The lane oracle uses `quant4`. That is not a reference match.
 - vLLM record, teacher-forced compare, long context, speed.
