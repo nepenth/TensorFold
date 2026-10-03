@@ -49,6 +49,8 @@ Stop here for a full load. The machines are free. The next command is still not 
 3. On both Sparks: Task 9B–9C passed. On one Spark, the Task 10D primitive graph passed: fixed bank, supplied ids change, table addresses do not. Prefill is eager and is not graph-qualified. The full-forward graph still needs the real router. No snapshot pull yet.
 4. Approved window only, after those gates: pull or reuse the 190.4 GiB snapshot at revision `da920bb`, record vLLM, run TensorFold, restore the previous serve. Task 12, then 13, then 14.
 
+Header census, no allocation. One rank keeps 95,777,735,492 bytes (89.200 GiB). The running peak is 99,462,461,744 bytes (92.632 GiB) at layer 43 if the packed layer overlaps the current reader's raw spans of that layer and the next. Those spans still include the other rank's columns. The retained set does not. `nvfp4_admit.guarded` stops in front of each layer unless the host available bytes cover that step plus a 16 GiB reserve. It does not read a cgroup cap. The resident load has not started. No serve.
+
 A CPU torch wheel can unskip the `load()` refusal test. It cannot qualify `split_device`, the MMA, graphs, or two-rank collectives.
 
 ---

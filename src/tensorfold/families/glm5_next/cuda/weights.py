@@ -496,8 +496,14 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             embed = (as_i32(rd.get(PREFIX + "embed_tokens.weight")).to(dev), rd.get(PREFIX + "embed_tokens.scales").to(dev),
                      rd.get(PREFIX + "embed_tokens.biases").to(dev))
         which = list(range(cfg.layers))
-        for i in which:
-            built.append(layer(i))
+        if nvfp4:
+            from .nvfp4_admit import guarded, host_available, steps_for
+
+            # Header spans only. The check is in front of each layer and does not read a cgroup cap.
+            guarded(which, steps_for(rd, cfg.layers), host_available, lambda i: built.append(layer(i)))
+        else:
+            for i in which:
+                built.append(layer(i))
         vl = cfg.vocab // world
         draft_head = None
         if bf16:
