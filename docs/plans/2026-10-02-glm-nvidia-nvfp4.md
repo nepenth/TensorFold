@@ -24,7 +24,7 @@ Decode and prefill share weights and the numeric meaning of a projection. They d
 
 Tracking note: `docs/plans/notes/nvidia-glm-nvfp4-status.md`. Branch `plan/glm-nvidia-nvfp4`. Checkpoint revision `da920bb0b9f4a06727223a349e55468e38352348`. Reference status `BLOCKED_REFERENCE`.
 
-CPU work through the allocation inventory is on the branch. `load()` still raises `NVFP4 tensors are not wired`. No shard has been pulled. One Spark has packed a dense gate and a synthetic routed layer. It has not loaded the snapshot.
+CPU work through the allocation inventory is on the branch. A synthetic fixture now packs routed experts and a dense layer that has scales. The pinned snapshot is local and has not been opened. The forward path still uses the grouped expert kernel.
 
 | Task | State |
 | --- | --- |

@@ -2,7 +2,7 @@
 
 Branch: `plan/glm-nvidia-nvfp4`. Plan: `docs/plans/2026-10-02-glm-nvidia-nvfp4.md`. Updated 2026-10-02 after the prompt and routed eager oracles.
 
-Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e38352348`. Reference: `BLOCKED_REFERENCE` (`nvidia-glm-nvfp4-reference.md`). No weight shard has been downloaded. The previous serve was a different checkpoint. It was stopped under an approved window. Restore steps are not in this public tree. The previous weights were left on disk.
+Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e38352348`. Reference: `BLOCKED_REFERENCE` (`nvidia-glm-nvfp4-reference.md`). The pinned snapshot is local on both ranks. The previous serve was a different checkpoint. It was stopped under an approved window. Restore steps are not in this public tree.
 
 ## Implemented
 
@@ -24,6 +24,7 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 | `99fe063` | Two-rank partials on one device. Row-split concat, column-split fp32 sum, rank 0 first. `split_k` recorded. No frozen envelope. 17 Spark tests. |
 | `cbd6603` | Two-rank NCCL smoke. Eager and captured ordered sum, two replays. Missing store peer failed in 3 seconds. Revision mismatch and independent expert ids recorded on both ranks. |
 | `8a28826` | Supplied-id primitive graph. Fixed bank, existing lane, device select. 79 Spark tests. Prefill is not graph-qualified. Not a full-forward graph. |
+| `dec9b8f` | Fixture load. Routed experts and a dense layer with scales pack through `Fp4Linear.from_checkpoint`. Layer 45 names in the index are skipped. A draft head still raises. 37 Spark tests. Not a snapshot load. The forward path still uses the grouped expert kernel. |
 
 On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
 
@@ -32,7 +33,7 @@ On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests pass
 ## Not implemented
 
 - CUDA graphs and a grouped device prefill GEMM. Task 10C packs on the host and reuses the lane eager oracle. That is not graph-qualified. One-token routed decode is indexed from the device table.
-- A snapshot load. `load()` still raises `NVFP4 tensors are not wired`.
+- A snapshot load. The fixture loader no longer raises `NVFP4 tensors are not wired`. The pinned snapshot has not been opened. The forward path still uses the grouped expert kernel.
 - Two-rank digest, missing-peer timeout, captured NCCL.
 - A numeric envelope for the dense projection against a saved reference. The lane oracle uses `quant4`. That is not a reference match.
 - vLLM record, teacher-forced compare, long context, speed.
@@ -44,6 +45,6 @@ The skipped GPU tests have now passed on one Spark. A rank-local dense gate has 
 
 The dense lane eager oracle, the prompt eager oracle, and the routed eager oracle have passed on one Spark. Forty-six tests passed. Three two-GPU device-mismatch cases were skipped. Lane and prompt were not compared bitwise. A gate above 10 differs numerically from `mlp_prompt`. No numeric envelope. No shard pull. No serve.
 
-The pinned snapshot is local on both ranks: 33 shards, index hash `26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1`, config hash `41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf`. The archive config omitted the layer-45 ignore lines; the pinned config replaced it after the archive byte count matched. No serve. `spark-llm` is not advertised.
+The pinned snapshot is local on both ranks: 33 shards, index hash `26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1`, config hash `41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf`. The archive config omitted the layer-45 ignore lines; the pinned config replaced it after the archive byte count matched. No serve. `spark-llm` is not advertised. The fixture loader passed. Do not open the snapshot until the forward path uses the packed table instead of the grouped expert kernel.
 
 Both Sparks are required for the recorded comparison and any speed number. Do not start `tensorfold serve` until the dry-run admission for the exact context exists. A serve in this window must not advertise `spark-llm`. Add that alias back only after the window is done, on the restored profile.
