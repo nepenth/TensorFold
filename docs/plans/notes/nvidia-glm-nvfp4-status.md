@@ -17,7 +17,7 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 | `90ce7a8` | CPU splits. Scalars replicate. Packed width 96 is rejected. Rank-folder provenance is checked. |
 | `0203859` | Logical activation codec, prepared-row layout (`k64-mpad-4`), and `nvfp4_inventory`. |
 | `585faa1` | Dense lane eager oracle. Common-input quant, `glue.swiglu`, one down into the caller fp32 buffer. Sixteen Spark tests. Not a reference envelope. |
-| this commit | Prompt eager oracle and routed eager oracle. Lane and prompt are not compared bitwise. Each down reads its own intermediate. Shared BF16 MLP still contributes when every routed weight is zero. |
+| `4383001` | Prompt eager oracle and routed eager oracle. Lane and prompt are not compared bitwise. Each down reads its own intermediate. Shared BF16 MLP still contributes when every routed weight is zero. |
 
 On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
 
