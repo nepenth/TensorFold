@@ -23,10 +23,10 @@ On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests pass
 
 ## Not implemented
 
-- Device-indexed expert dispatch, eager GPU oracles, packed prefill, CUDA graphs.
+- Device-indexed expert dispatch, the prompt eager oracle, the routed eager oracle, packed prefill, CUDA graphs.
 - A snapshot load. `load()` still raises `NVFP4 tensors are not wired`.
 - Two-rank digest, missing-peer timeout, captured NCCL.
-- A numeric envelope for the dense projection. The codec is still not `quant4`.
+- A numeric envelope for the dense projection against a saved reference. The lane oracle uses `quant4`. That is not a reference match.
 - vLLM record, teacher-forced compare, long context, speed.
 - Recipe text. Nothing is `DENSE_FIDELITY_PASS`.
 
@@ -34,6 +34,8 @@ On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests pass
 
 The skipped GPU tests have now passed on one Spark. A rank-local dense gate has been packed and run through the existing lane kernel and the prompt GEMM. A synthetic routed layer is a single-owner pointer table. Outputs of the dense gate were finite bf16. Recorded `split_k` is 2. No numeric envelope. No shard pull. No serve.
 
-The next single-Spark gate is the eager oracles, then the dispatch sanitizer. A private continuation loop advances that batch if this session stops. It does not start a serve.
+The dense lane eager oracle has passed on one Spark: 16 tests, same-backend bitwise, a refused destination left untouched, and a gate above 10 differs from `mlp_prompt`. Lane and prompt were not compared bitwise. No numeric envelope. No shard pull. No serve.
+
+The next single-Spark gate is the prompt oracle and the routed oracle, then the dispatch sanitizer. A private continuation loop advances that batch if this session stops. It does not start a serve.
 
 Both Sparks are required for NCCL, graph replay across ranks, the recorded comparison, and any speed number. Do not pull the 190.4 GiB snapshot, and do not start `tensorfold serve`, until those single-Spark gates have passed. The approved window already names how the previous serve is restored. That is not a license to start Task 12.
