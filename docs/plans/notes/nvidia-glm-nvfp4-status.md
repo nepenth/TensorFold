@@ -28,6 +28,7 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 | `2935fe8` | Packed-layer forward. One token matches `routed_decode` on the same table. Dense scales use `dense_eager`. Multi-row stays eager and is not graph-qualified. Grouped experts are not called. 20 Spark tests. Not a snapshot load. Not a serve. |
 | `cdbee00` | Synthetic engine step. Both ranks, one token, finite logits. Grouped experts are not called. No CUDA graph. Fixture hidden size is 128. `hc_mult` and the convolution width match the pinned config. Not a snapshot load. |
 | `51f420e` | Per-expert global scales. Each expert's `weight_scale_2` and `input_scale` land in its alpha slot. Same-expert shard disagreement still raises. 35 Spark tests. One language-model MoE layer packed: 288 experts, 864 linears. Not a full snapshot load. Not a serve. |
+| `159d73e` | Header census and a per-layer host reserve. One rank keeps 89.200 GiB. Peak 92.632 GiB at layer 43 if the packed layer overlaps the current reader's raw spans. Four CPU tests. No resident load. No serve. |
 
 On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
 
