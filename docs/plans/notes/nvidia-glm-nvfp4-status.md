@@ -1,6 +1,6 @@
 # GLM NVFP4 status
 
-Branch: `plan/glm-nvidia-nvfp4`. Plan: `docs/plans/2026-10-02-glm-nvidia-nvfp4.md`. Updated 2026-10-03 after a rank-0 resident load that was measured and dropped.
+Branch: `plan/glm-nvidia-nvfp4`. Plan: `docs/plans/2026-10-02-glm-nvidia-nvfp4.md`. Updated 2026-10-04 after a rank-0 token that was measured and dropped.
 
 Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e38352348`. Reference: `BLOCKED_REFERENCE` (`nvidia-glm-nvfp4-reference.md`). The pinned snapshot is local on both ranks. The previous serve was a different checkpoint. It was stopped under an approved window. Restore steps are not in this public tree.
 
@@ -31,10 +31,11 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 | `159d73e` | Header census and a per-layer host reserve. One rank keeps 89.200 GiB. Peak 92.632 GiB at layer 43 if the packed layer overlaps the current reader's raw spans. Four CPU tests. No resident load. No serve. |
 | `df46d92` | The reserve check uses the layer increment, not the running peak. Four CPU tests. No resident load. No serve. |
 | `1a62620` | Rank-0 resident load measured and dropped. Layers 0 through 44. 88.610 GiB retained, 90.104 GiB peak. Not a token. No serve. |
+| `4e8300d` | KDA conv weights from the pinned snapshot are stored as bf16. The chain kernel rejects fp32. No serve. |
 
 ## Measured
 
-Rank 0 and rank 1 have each loaded layers 0 through 44 and returned one finite bf16 token `[1, 77440]`, then dropped. They were not resident at the same time. After the conv cast, `Weights.nbytes` was 95,140,735,476 bytes (88.607 GiB). Peak allocated on the first rank-0 load was 96,748,635,136 bytes (90.104 GiB). While resident, available memory stayed above the 16 GiB reserve. Layer 45 was not loaded. Not a two-rank collective. No serve.
+Rank 0 loaded layers 0 through 44, returned one finite bf16 token `[1, 77440]`, and was dropped. The engine used one prefill row, not 2048. After the conv cast, `Weights.nbytes` was 95,140,735,476 bytes (88.607 GiB). While resident, 21,976,444 kB remained available. During the token, 21,169,788 kB remained available, above the 16 GiB reserve. After the drop, 120,736,908 kB were available. Peak allocated on the first rank-0 load was 96,748,635,136 bytes (90.104 GiB). Layer 45 was not loaded. Rank 1 has not returned a token. Not a two-rank collective. No serve.
 
 On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
 
@@ -43,7 +44,7 @@ On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests pass
 ## Not implemented
 
 - CUDA graphs and a grouped device prefill GEMM. Task 10C packs on the host and reuses the lane eager oracle. That is not graph-qualified. One-token routed decode is indexed from the device table.
-- A serving resident load and a two-rank token. Each rank has returned one finite token on its own and was dropped. Modelopt does not capture a CUDA graph.
+- A serving resident load and the second rank. Rank 0 returned one finite token and was dropped. Rank 1 has not. Modelopt does not capture a CUDA graph.
 - The snapshot two-rank token. The small-tensor NCCL smoke already passed. These two ranks have not been resident together.
 - A numeric envelope for the dense projection against a saved reference. The lane oracle uses `quant4`. That is not a reference match.
 - vLLM record, teacher-forced compare, long context, speed.
@@ -55,7 +56,7 @@ The skipped GPU tests have now passed on one Spark. A rank-local dense gate has 
 
 The dense lane eager oracle, the prompt eager oracle, and the routed eager oracle have passed on one Spark. Forty-six tests passed. Three two-GPU device-mismatch cases were skipped. Lane and prompt were not compared bitwise. A gate above 10 differs numerically from `mlp_prompt`. No numeric envelope. The pinned snapshot is local. No serve.
 
-The pinned snapshot is local on both ranks: 33 shards, index hash `26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1`, config hash `41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf`. The archive config omitted the layer-45 ignore lines; the pinned config replaced it after the archive byte count matched. No serve. `spark-llm` is not advertised. Layers 3 through 44 each packed and were dropped before the next: 288 experts and 864 linears every layer. Dense layers 0, 1, and 2 each packed as one projection triple and were dropped. Layer 45 was not loaded. Rank 0 then held layers 0 through 44 and was dropped. See Measured. Modelopt does not capture a CUDA graph.
+The pinned snapshot is local on both ranks: 33 shards, index hash `26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1`, config hash `41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf`. The archive config omitted the layer-45 ignore lines; the pinned config replaced it after the archive byte count matched. No serve. `spark-llm` is not advertised. Layers 3 through 44 each packed and were dropped before the next: 288 experts and 864 linears every layer. Dense layers 0, 1, and 2 each packed as one projection triple and were dropped. Layer 45 was not loaded. Rank 0 then held layers 0 through 44, returned one finite token, and was dropped. See Measured. Rank 1 has not. Modelopt does not capture a CUDA graph.
 
 Both Sparks are required for the recorded comparison and any speed number. Do not start `tensorfold serve` until the dry-run admission for the exact context exists. A serve in this window must not advertise `spark-llm`. Add that alias back only after the window is done, on the restored profile.
 
