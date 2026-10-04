@@ -24,7 +24,7 @@ Decode and prefill share weights and the numeric meaning of a projection. They d
 
 Tracking note: `docs/plans/notes/nvidia-glm-nvfp4-status.md`. Branch `plan/glm-nvidia-nvfp4`. Checkpoint revision `da920bb0b9f4a06727223a349e55468e38352348`. Reference status `BLOCKED_REFERENCE`.
 
-Each expert keeps its own global scales. Rank 0 and rank 1 have each loaded layers 0 through 44, returned one finite bf16 token, and dropped them. They were not resident together. Layer 45 was not loaded. Modelopt does not capture a CUDA graph. No serve.
+Each expert keeps its own global scales. Both ranks were resident together, each returned one finite bf16 token, and both were dropped. Layer 45 was not loaded. Modelopt does not capture a CUDA graph. No serve.
 
 | Task | State |
 | --- | --- |
@@ -35,11 +35,11 @@ Each expert keeps its own global scales. Rank 0 and rank 1 have each loaded laye
 | 5A–5D Codec, prepared rows, one projection | Done as finite bf16 on lane and prompt. Recorded `split_k` is 2. Same-backend eager oracles passed later. No numeric envelope. |
 | 11A Inventory | Done. Draft-head byte term is off for this quant. |
 | 11B Measure peaks | Partial. Each rank's one-token load peak is measured. Prefill peak and a captured peak are not. Modelopt does not capture a graph. |
-| 6 Load | Fixture load, per-expert scales, pack-and-drop of every language-model layer except 45, then a resident load and one token on each rank. After the conv cast, `Weights.nbytes` was 95,140,735,476 bytes (88.607 GiB) on each rank. Each token was finite bf16 `[1, 77440]`. The ranks were not resident together. The tables were dropped. |
-| 7 Startup before NCCL | Partial. Explicit MTP, a drafter, and `--parallel` raise before the engine import. The small-tensor two-rank smoke recorded a missing peer and a revision mismatch. That is not a snapshot collective. |
+| 6 Load | Fixture load, per-expert scales, pack-and-drop of every language-model layer except 45, then a two-rank resident load and one token. After the conv cast, `Weights.nbytes` was 95,140,735,476 bytes (88.607 GiB) on each rank. Each token was finite bf16 `[1, 77440]`. The tables were dropped. |
+| 7 Startup before NCCL | Partial. Explicit MTP, a drafter, and `--parallel` raise before the engine import. The small-tensor smoke recorded a missing peer and a revision mismatch. The snapshot two-rank token is a later, separate proof. |
 | 8 Eager oracles | Passed on one Spark. Lane and prompt are not compared bitwise. |
 | 9A TP partials | Passed on one device. Envelope not frozen. |
-| 9B–9C Two ranks | Small-tensor NCCL smoke passed. Not a snapshot load on two ranks. |
+| 9B–9C Two ranks | Small-tensor NCCL smoke passed. The snapshot two-rank token is recorded in Measured. It is one eager row, not a graph. |
 | 10A–10C Device dispatch and prefill pack | Passed. 10C is an eager pack, not a grouped device GEMM, and not graph-qualified. Sanitizer zero errors on the canary only. |
 | 10D Graph | Primitive graph passed: fixed bank, supplied ids change, table addresses do not. Full-forward graph is not done. The real router is not in that capture. |
 | 12 Record and compare, 13 long context, 14 speed | Not started. Reference is `BLOCKED_REFERENCE`. Do not start these from a clear calendar. |
@@ -51,7 +51,7 @@ The next command is still not `tensorfold serve`.
 1. The pinned snapshot is local on both ranks. 33 shards. Index `26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1`. Config `41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf`.
 2. Header census: one rank keeps 95,777,735,492 bytes (89.200 GiB). The running peak is 99,462,461,744 bytes (92.632 GiB) at layer 43 if the packed layer overlaps the current reader's raw spans. Column spans still include the other rank's bytes. The retained set does not.
 3. `nvfp4_admit.guarded` stops in front of each layer unless available bytes cover that layer's increment plus a 16 GiB reserve. It does not read a cgroup cap. The rank-0 load above used that check and was dropped.
-4. Each rank returned finite bf16 logits `[1, 77440]` and was dropped. The engine used one prefill row, not 2048. Rank 1 peak allocated was 96,742,671,360 bytes. During that token, 21,244,188 kB remained available. Next proof: both ranks, one real-weight token, then drop. Not a second resident copy on one machine. Not a serve. `spark-llm` is not advertised.
+4. Both ranks started together, loaded layers 0 through 44, and each returned finite bf16 logits `[1, 77440]`. The engine used one prefill row and no CUDA graph. While both were resident, 21,322,172 kB and 21,353,128 kB remained available. Both were then dropped. Next proof is not a serve. `spark-llm` is not advertised.
 
 A CPU torch wheel can unskip the `load()` refusal test. It cannot qualify `split_device`, the MMA, graphs, or two-rank collectives.
 

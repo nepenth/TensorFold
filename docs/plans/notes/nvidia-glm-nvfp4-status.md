@@ -35,7 +35,7 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 
 ## Measured
 
-Rank 0 and rank 1 have each loaded layers 0 through 44, returned one finite bf16 token `[1, 77440]`, and dropped. They were not resident at the same time. The engine used one prefill row, not 2048, and one eager replay. After the conv cast, `Weights.nbytes` was 95,140,735,476 bytes (88.607 GiB) on each rank. Rank 0 peak allocated was 96,748,635,136 bytes (90.104 GiB). While that rank was resident, 21,976,444 kB remained available. During its token, 21,169,788 kB remained available. After its drop, 120,736,908 kB were available. Rank 1 peak allocated was 96,742,671,360 bytes (90.099 GiB). While that rank was resident, 22,060,408 kB remained available. During its token, 21,244,188 kB remained available, above the 16 GiB reserve. After its drop, 120,818,628 kB were available. Layer 45 was not loaded. Not a two-rank collective. No serve.
+Both ranks were resident together. Each loaded layers 0 through 44 and returned one finite bf16 token `[1, 77440]`, then both were dropped. The engine used one prefill row, not 2048, and no CUDA graph. After the conv cast, `Weights.nbytes` was 95,140,735,476 bytes (88.607 GiB) on each rank. While both were resident, 21,322,172 kB and 21,353,128 kB remained available, above the 16 GiB reserve. After the drop, 122,519,932 kB and 122,557,312 kB were available. The earlier alone-rank peaks still stand: rank 0 peak allocated 96,748,635,136 bytes, rank 1 peak allocated 96,742,671,360 bytes. Layer 45 was not loaded. This token is not a graph, not a 2048-row prefill, and not a serve.
 
 On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
 
@@ -44,8 +44,8 @@ On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests pass
 ## Not implemented
 
 - CUDA graphs and a grouped device prefill GEMM. Task 10C packs on the host and reuses the lane eager oracle. That is not graph-qualified. One-token routed decode is indexed from the device table.
-- A serving resident load. Each rank has returned one finite token on its own and was dropped. Modelopt does not capture a CUDA graph.
-- The snapshot two-rank token. The small-tensor NCCL smoke already passed. These two ranks have not been resident together.
+- A serving resident load. The two-rank token was dropped. Modelopt does not capture a CUDA graph.
+- A full-forward graph of this snapshot. The two-rank token used one eager row.
 - A numeric envelope for the dense projection against a saved reference. The lane oracle uses `quant4`. That is not a reference match.
 - vLLM record, teacher-forced compare, long context, speed.
 - Recipe text. Nothing is `DENSE_FIDELITY_PASS`.
@@ -56,7 +56,7 @@ The skipped GPU tests have now passed on one Spark. A rank-local dense gate has 
 
 The dense lane eager oracle, the prompt eager oracle, and the routed eager oracle have passed on one Spark. Forty-six tests passed. Three two-GPU device-mismatch cases were skipped. Lane and prompt were not compared bitwise. A gate above 10 differs numerically from `mlp_prompt`. No numeric envelope. The pinned snapshot is local. No serve.
 
-The pinned snapshot is local on both ranks: 33 shards, index hash `26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1`, config hash `41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf`. The archive config omitted the layer-45 ignore lines; the pinned config replaced it after the archive byte count matched. No serve. `spark-llm` is not advertised. Layers 3 through 44 each packed and were dropped before the next: 288 experts and 864 linears every layer. Dense layers 0, 1, and 2 each packed as one projection triple and were dropped. Layer 45 was not loaded. Each rank then held layers 0 through 44, returned one finite token, and was dropped. They were not resident together. See Measured. Modelopt does not capture a CUDA graph.
+The pinned snapshot is local on both ranks: 33 shards, index hash `26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1`, config hash `41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf`. The archive config omitted the layer-45 ignore lines; the pinned config replaced it after the archive byte count matched. No serve. `spark-llm` is not advertised. Layers 3 through 44 each packed and were dropped before the next: 288 experts and 864 linears every layer. Dense layers 0, 1, and 2 each packed as one projection triple and were dropped. Layer 45 was not loaded. Both ranks then held layers 0 through 44 together, each returned one finite token, and both were dropped. See Measured. Modelopt does not capture a CUDA graph.
 
 Both Sparks are required for the recorded comparison and any speed number. Do not start `tensorfold serve` until the dry-run admission for the exact context exists. A serve in this window must not advertise `spark-llm`. Add that alias back only after the window is done, on the restored profile.
 
