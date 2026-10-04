@@ -34,7 +34,7 @@ Checkpoint: `nvidia/GLM-5.3-Flash-NVFP4` at `da920bb0b9f4a06727223a349e55468e383
 
 ## Measured
 
-Rank 0 loaded layers 0 through 44 under the incremental host reserve, then dropped them. `Weights.nbytes` was 95,144,077,812 bytes (88.610 GiB) before the conv cast, and 95,140,735,476 bytes after the checkpoint's fp32 conv weights were stored as bf16. Peak allocated on the first load was 96,748,635,136 bytes (90.104 GiB). While resident, 22,198,228 kB remained available, above the 16 GiB reserve. One token then returned finite bf16 logits `[1, 77440]`. The tables were dropped. Layer 45 was not loaded. One rank, not a two-rank collective. No serve.
+Rank 0 and rank 1 have each loaded layers 0 through 44 and returned one finite bf16 token `[1, 77440]`, then dropped. They were not resident at the same time. After the conv cast, `Weights.nbytes` was 95,140,735,476 bytes (88.607 GiB). Peak allocated on the first rank-0 load was 96,748,635,136 bytes (90.104 GiB). While resident, available memory stayed above the 16 GiB reserve. Layer 45 was not loaded. Not a two-rank collective. No serve.
 
 On the CPU workstation, 47 tests passed and 2 were skipped: `load()` because PyTorch was not installed, and `split_device` because there was no CUDA device.
 
@@ -43,8 +43,8 @@ On one DGX Spark, PyTorch 2.13.0+cu130, capability (12, 1): those two tests pass
 ## Not implemented
 
 - CUDA graphs and a grouped device prefill GEMM. Task 10C packs on the host and reuses the lane eager oracle. That is not graph-qualified. One-token routed decode is indexed from the device table.
-- A serving resident load and the second rank. Rank 0 returned one finite token and was dropped. Modelopt does not capture a CUDA graph.
-- Two-rank digest, missing-peer timeout, captured NCCL.
+- A serving resident load and a two-rank token. Each rank has returned one finite token on its own and was dropped. Modelopt does not capture a CUDA graph.
+- The snapshot two-rank token. The small-tensor NCCL smoke already passed. These two ranks have not been resident together.
 - A numeric envelope for the dense projection against a saved reference. The lane oracle uses `quant4`. That is not a reference match.
 - vLLM record, teacher-forced compare, long context, speed.
 - Recipe text. Nothing is `DENSE_FIDELITY_PASS`.
