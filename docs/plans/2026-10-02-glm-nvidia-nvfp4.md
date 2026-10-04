@@ -51,7 +51,7 @@ The next command is still not `tensorfold serve`.
 1. The pinned snapshot is local on both ranks. 33 shards. Index `26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1`. Config `41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf`.
 2. Header census: one rank keeps 95,777,735,492 bytes (89.200 GiB). The running peak is 99,462,461,744 bytes (92.632 GiB) at layer 43 if the packed layer overlaps the current reader's raw spans. Column spans still include the other rank's bytes. The retained set does not.
 3. `nvfp4_admit.guarded` stops in front of each layer unless available bytes cover that layer's increment plus a 16 GiB reserve. It does not read a cgroup cap. The rank-0 load above used that check and was dropped.
-4. Next proof: one real-weight token on that rank-0 set, then drop. Not a second resident copy. Not a serve. `spark-llm` is not advertised.
+4. Next proof: rank 1, one real-weight token, then drop. Rank 0 already returned finite bf16 logits `[1, 77440]`. Not a second resident copy. Not a serve. `spark-llm` is not advertised.
 
 A CPU torch wheel can unskip the `load()` refusal test. It cannot qualify `split_device`, the MMA, graphs, or two-rank collectives.
 
