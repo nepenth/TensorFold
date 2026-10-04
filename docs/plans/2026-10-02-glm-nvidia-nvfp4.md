@@ -24,32 +24,34 @@ Decode and prefill share weights and the numeric meaning of a projection. They d
 
 Tracking note: `docs/plans/notes/nvidia-glm-nvfp4-status.md`. Branch `plan/glm-nvidia-nvfp4`. Checkpoint revision `da920bb0b9f4a06727223a349e55468e38352348`. Reference status `BLOCKED_REFERENCE`.
 
-CPU work through the allocation inventory is on the branch. Each expert keeps its own global scales. One language-model MoE layer packed: 288 experts. The other layers have not been opened. Modelopt does not capture a CUDA graph.
+Each expert keeps its own global scales. Rank 0 has loaded layers 0 through 44 from the pinned snapshot and dropped them. Layer 45 was not loaded. Modelopt does not capture a CUDA graph. No serve.
 
 | Task | State |
 | --- | --- |
-| 0 Manifest, 0A comparator, 1 census, 2 refusal lock | Done. `tests/test_glm5_nvfp4_compare.py` and the CPU half of `tests/test_glm5_nvfp4_config.py`. |
-| 0B Reference | `BLOCKED_REFERENCE`. The live serve was a RedHat compressed-tensors tree, still loading, not this revision. No completion was recorded. It is not the oracle. |
-| 3 Admit the recipe | Done. `QUANT_METHODS["cuda"]` includes `modelopt` only for static NVFP4, group 16. Neighbor recipes raise. `tests/cuda/test_glm_split_and_policy.py` passed on one Spark (10). |
-| 4 Splits | CPU path done in `split.py` and `tests/test_glm5_nvfp4_split.py`. `split_device` matches `split_bytes` on one Spark. That is the CUDA prefetch, not the MMA. |
-| 5A–5B Codec and prepared rows | Done in `nvfp4_codec.py`. This is TensorFold's e4m3 decoder, not current ModelOpt `main`, and not `quant4`. |
-| 5C–5D One real projection, lane and prompt kernels | Mapper landed. On one Spark, a rank-local dense gate (`N=6144`, `K=4096`) is an `Fp4Linear` with stored `input_scale` and uninverted `weight_scale_2`. Lane and prompt both returned finite bf16 `[1, 6144]`. Recorded `split_k` is 2. They were not compared bitwise. A numeric envelope is not claimed; that waits for the eager oracle. |
-| 11A Inventory | Done as `nvfp4_inventory` and `split_weights(..., draft_head=False)`. The engine uses that flag when `quant == "modelopt"`. Measured peaks (11B) are not done. |
-| 6 Load experts into the pointer table | Synthetic layer passed on one Spark. E=4 owners and the address table share `data_ptr`. E=288 allocated pointer slots only, not production weights. A scale disagreement raises before packing. `load()` still refuses a modelopt tree. The snapshot is not pulled. |
-| 7 Startup before NCCL | Partial. Explicit `TF_GLM_MTP=1`, a drafter, and `--parallel` raise before the engine import. Inside `GlmEngine`, modelopt forces `mtp_on` false. The two-rank digest and the missing-peer timeout are not implemented. |
-| 8 Eager oracles, 9 two ranks, 10 device dispatch and graphs | Prompt and routed eager oracles passed on one Spark, with the dense lane oracle. Lane and prompt were not compared bitwise. Device dispatch, graphs, and two ranks are not done. |
-| 12 Record and compare, 13 long context, 14 speed | **Needs both Sparks** and an approved window. Do not start these because the CPU tasks are finished. |
+| 0 Manifest, 0A comparator, 1 census, 2 refusal lock | Done. Reference status remains `BLOCKED_REFERENCE`. |
+| 0B Reference | `BLOCKED_REFERENCE`. The previous serve was a different checkpoint. No completion was recorded. It is not the oracle. |
+| 3 Admit the recipe | Done. Static NVFP4, group 16 only. Neighbor recipes raise. |
+| 4 Splits | CPU path done. `split_device` matches `split_bytes` on one Spark. |
+| 5A–5D Codec, prepared rows, one projection | Done as finite bf16 on lane and prompt. Recorded `split_k` is 2. Same-backend eager oracles passed later. No numeric envelope. |
+| 11A Inventory | Done. Draft-head byte term is off for this quant. |
+| 11B Measure peaks | Partial. Rank 0 load peak is measured. Prefill peak and a captured peak are not. Modelopt does not capture a graph. |
+| 6 Load | Fixture load, per-expert scales, pack-and-drop of every language-model layer except 45, then a rank-0 resident load. `Weights.nbytes` was 95,144,077,812 bytes (88.610 GiB). Peak allocated was 96,748,635,136 bytes (90.104 GiB). While resident, 22,198,228 kB remained available. The tables were dropped. Not a token. |
+| 7 Startup before NCCL | Partial. Explicit MTP, a drafter, and `--parallel` raise before the engine import. The small-tensor two-rank smoke recorded a missing peer and a revision mismatch. That is not a snapshot collective. |
+| 8 Eager oracles | Passed on one Spark. Lane and prompt are not compared bitwise. |
+| 9A TP partials | Passed on one device. Envelope not frozen. |
+| 9B–9C Two ranks | Small-tensor NCCL smoke passed. Not a snapshot load on two ranks. |
+| 10A–10C Device dispatch and prefill pack | Passed. 10C is an eager pack, not a grouped device GEMM, and not graph-qualified. Sanitizer zero errors on the canary only. |
+| 10D Graph | Primitive graph passed: fixed bank, supplied ids change, table addresses do not. Full-forward graph is not done. The real router is not in that capture. |
+| 12 Record and compare, 13 long context, 14 speed | Not started. Reference is `BLOCKED_REFERENCE`. Do not start these from a clear calendar. |
 
 ### Spark boundary
 
-Stop here for a full load. The machines are free. The next command is still not `tensorfold serve`.
+The next command is still not `tensorfold serve`.
 
-1. On one Spark, with PyTorch CUDA: Task 5C–5D has run one dense gate through `lane` and the prompt GEMM. Finite bf16, `split_k` 2. No numeric envelope yet. No second model, no weight-shard delete.
-2. On one Spark: the synthetic pointer table, eager oracles, Tasks 10A–10C, and Task 9A have passed. 10C is an eager pack, not a grouped device GEMM and not graph-qualified. 9A records `split_k` and does not freeze an envelope. No snapshot pull.
-3. On both Sparks: Task 9B–9C passed. On one Spark, the Task 10D primitive graph passed: fixed bank, supplied ids change, table addresses do not. Prefill is eager and is not graph-qualified. The full-forward graph still needs the real router. No snapshot pull yet.
-4. Approved window only, after those gates: pull or reuse the 190.4 GiB snapshot at revision `da920bb`, record vLLM, run TensorFold, restore the previous serve. Task 12, then 13, then 14.
-
-Header census, no allocation. One rank keeps 95,777,735,492 bytes (89.200 GiB). The running peak is 99,462,461,744 bytes (92.632 GiB) at layer 43 if the packed layer overlaps the current reader's raw spans of that layer and the next. Those spans still include the other rank's columns. The retained set does not. `nvfp4_admit.guarded` stops in front of each layer unless the host available bytes cover that step plus a 16 GiB reserve. It does not read a cgroup cap. The resident load has not started. No serve.
+1. The pinned snapshot is local on both ranks. 33 shards. Index `26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1`. Config `41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf`.
+2. Header census: one rank keeps 95,777,735,492 bytes (89.200 GiB). The running peak is 99,462,461,744 bytes (92.632 GiB) at layer 43 if the packed layer overlaps the current reader's raw spans. Column spans still include the other rank's bytes. The retained set does not.
+3. `nvfp4_admit.guarded` stops in front of each layer unless available bytes cover that layer's increment plus a 16 GiB reserve. It does not read a cgroup cap. The rank-0 load above used that check and was dropped.
+4. Next proof: one real-weight token on that rank-0 set, then drop. Not a second resident copy. Not a serve. `spark-llm` is not advertised.
 
 A CPU torch wheel can unskip the `load()` refusal test. It cannot qualify `split_device`, the MMA, graphs, or two-rank collectives.
 
@@ -571,21 +573,21 @@ CPU, done on this branch unless noted:
 - [x] `tests/test_glm5_nvfp4_config.py`, `tests/test_glm5_nvfp4_split.py`, `tests/test_glm5_nvfp4_codec.py`, and `tests/test_glm5_nvfp4_inventory.py` pass. The `load()` refusal and `split_device` passed on one Spark. `tests/test_glm5_nvfp4_loader.py` does not exist yet.
 - [x] MLX/EXL3 `MTP_DEFAULT` is still `"1"` (`tests/test_glm_mtp_setting.py`).
 - [ ] Qwen and Flash Next still refuse NVFP4 `--tp 2`. `tests/cuda/test_glm_split_and_policy.py` passed on one Spark (10). That file does not cover Qwen or Flash Next.
-- [x] Explicit `TF_GLM_MTP=1` on this quant raises before the engine import. Modelopt forces `mtp_on` false inside `GlmEngine`. The two-rank digest is not built yet.
+- [x] Explicit `TF_GLM_MTP=1` on this quant raises before the engine import. Modelopt forces `mtp_on` false inside `GlmEngine`. The snapshot two-rank digest is not built. The small-tensor smoke recorded a revision mismatch.
 - [x] Prepared-row test fails if the scale layout is treated as row-major. Scale axis 0 is a K group.
-- [x] Inventory says one pointer table, nine fp32 slots, no draft head, no second copy. Nothing has allocated those bytes yet.
+- [x] Inventory says one pointer table, nine fp32 slots, no draft head, no second copy. Rank 0 later allocated 95,144,077,812 bytes and was dropped.
 
 Spark, not done:
 
 - [x] `split_device` matches `split_bytes` on a GPU.
-- [ ] One dense projection is an `Fp4Linear` and matches the lane and prompt kernels. The projection runs on both and is finite. `split_k` for `N=6144`, `K=4096` is 2. A numeric envelope is not recorded yet.
-- [ ] Pointer-table test shows one data pointer for eager and device paths. Synthetic E=4 eager owners match the address table by `data_ptr`. The device dispatch path is not built.
+- [x] One dense projection is an `Fp4Linear`. Lane and prompt both returned finite bf16. `split_k` for `N=6144`, `K=4096` is 2. Same-backend eager oracles passed. A numeric envelope is not recorded.
+- [x] Synthetic E=4 eager owners match the address table by `data_ptr`. Device dispatch landed. That is not a production-snapshot identity check.
 - [x] Expert downs are not `matmul_group`. Unequal weights and unequal `weight_scale_2` fail the test if a down is grouped with another expert. The shared slot is separate from the highest expert id.
-- [ ] Primitive graph and full-forward graph both follow a changed route.
-- [ ] Prefill worst-case capacity is in the live admission path. Empty experts do no logical work.
-- [ ] Two-rank digest, missing peer, and captured collectives.
-- [ ] Sanitizer result for the dispatch is pass or an explicit limitation.
-- [ ] No `incoai` pull, no second model copy, live serve restored after any approved window.
+- [ ] Primitive graph follows a supplied-id change. Full-forward graph does not. The real router is not in that capture.
+- [ ] Prefill worst-case capacity is in the live admission path. Empty experts do no logical work. 10C tests the pack. It is not graph-qualified.
+- [x] Small-tensor two-rank digest, missing peer, and captured ordered sum passed. A snapshot two-rank load has not.
+- [x] Sanitizer zero errors on the 10A canary only. Other shapes are an explicit limitation, not a pass.
+- [ ] The pinned snapshot is local. The previous serve was not restored. No second resident copy. No recipe claim.
 - [ ] Recipe text matches a status record. `DENSE_FIDELITY_PASS` is not `LONG_CONTEXT_FIDELITY_PASS`.
 
 ## References
