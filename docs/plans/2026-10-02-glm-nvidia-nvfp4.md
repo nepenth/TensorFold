@@ -51,7 +51,7 @@ The next command is still not `tensorfold serve`.
 1. The pinned snapshot is local on both ranks. 33 shards. Index `26765b2601fd246ef361cfb9f5e10f9fb291a59e05ad0a109062f3a4747c7fd1`. Config `41db2811023b40ba4c8f8bbba88bce7dff377af51ecd18b32469a2a07064ebaf`.
 2. Header census: one rank keeps 95,777,735,492 bytes (89.200 GiB). The running peak is 99,462,461,744 bytes (92.632 GiB) at layer 43 if the packed layer overlaps the current reader's raw spans. Column spans still include the other rank's bytes. The retained set does not.
 3. `nvfp4_admit.guarded` stops in front of each layer unless available bytes cover that layer's increment plus a 16 GiB reserve. It does not read a cgroup cap. The rank-0 load above used that check and was dropped.
-4. Both ranks started together, loaded layers 0 through 44, and each returned finite bf16 logits `[1, 77440]`. The engine used one prefill row and no CUDA graph. While both were resident, 21,322,172 kB and 21,353,128 kB remained available. Both were then dropped. Next proof is not a serve. `spark-llm` is not advertised.
+4. Both ranks started together, agreed a snapshot digest, and each returned finite bf16 logits `[1, 77440]`. The digest shared the pinned config hash, context 2051, and policy `modelopt`. The engine used one prefill row and no CUDA graph. Both were then dropped. Next proof is not a serve. `spark-llm` is not advertised.
 
 A CPU torch wheel can unskip the `load()` refusal test. It cannot qualify `split_device`, the MMA, graphs, or two-rank collectives.
 
@@ -573,7 +573,7 @@ CPU, done on this branch unless noted:
 - [x] `tests/test_glm5_nvfp4_config.py`, `tests/test_glm5_nvfp4_split.py`, `tests/test_glm5_nvfp4_codec.py`, and `tests/test_glm5_nvfp4_inventory.py` pass. The `load()` refusal and `split_device` passed on one Spark. `tests/test_glm5_nvfp4_loader.py` does not exist yet.
 - [x] MLX/EXL3 `MTP_DEFAULT` is still `"1"` (`tests/test_glm_mtp_setting.py`).
 - [ ] Qwen and Flash Next still refuse NVFP4 `--tp 2`. `tests/cuda/test_glm_split_and_policy.py` passed on one Spark (10). That file does not cover Qwen or Flash Next.
-- [x] Explicit `TF_GLM_MTP=1` on this quant raises before the engine import. Modelopt forces `mtp_on` false inside `GlmEngine`. The snapshot two-rank digest is not built. The small-tensor smoke recorded a revision mismatch.
+- [x] Explicit `TF_GLM_MTP=1` on this quant raises before the engine import. Modelopt forces `mtp_on` false inside `GlmEngine`. The snapshot two-rank digest agreed on the pinned config hash, context 2051, and policy `modelopt`. The small-tensor smoke still recorded a revision mismatch.
 - [x] Prepared-row test fails if the scale layout is treated as row-major. Scale axis 0 is a K group.
 - [x] Inventory says one pointer table, nine fp32 slots, no draft head, no second copy. Rank 0 later allocated 95,144,077,812 bytes and was dropped.
 
@@ -585,7 +585,7 @@ Spark, not done:
 - [x] Expert downs are not `matmul_group`. Unequal weights and unequal `weight_scale_2` fail the test if a down is grouped with another expert. The shared slot is separate from the highest expert id.
 - [ ] Primitive graph follows a supplied-id change. Full-forward graph does not. The real router is not in that capture.
 - [ ] Prefill worst-case capacity is in the live admission path. Empty experts do no logical work. 10C tests the pack. It is not graph-qualified.
-- [x] Small-tensor two-rank digest, missing peer, and captured ordered sum passed. A snapshot two-rank load has not.
+- [x] Small-tensor two-rank digest, missing peer, and captured ordered sum passed. A snapshot two-rank load has agreed a digest and returned one eager token. That is not a graph.
 - [x] Sanitizer zero errors on the 10A canary only. Other shapes are an explicit limitation, not a pass.
 - [ ] The pinned snapshot is local. The previous serve was not restored. No second resident copy. No recipe claim.
 - [ ] Recipe text matches a status record. `DENSE_FIDELITY_PASS` is not `LONG_CONTEXT_FIDELITY_PASS`.
